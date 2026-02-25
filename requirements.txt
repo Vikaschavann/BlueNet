@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+websockets
+opencv-python-headless
+numpy
+nudenet
+faster-whisper
+detoxify
+torch
+huggingface-hub
+python-multipart
+pydantic
+aiofiles
