@@ -18,6 +18,8 @@ class WebSocketHandler:
         logging.info(f"WebSocket connection accepted: {websocket.client}")
         loop = asyncio.get_event_loop()
         
+        is_processing_video = False
+        
         try:
             while True:
                 data = await websocket.receive_json()
@@ -30,6 +32,11 @@ class WebSocketHandler:
                     continue
                 
                 if msg_type == "video_frame":
+                    if is_processing_video:
+                        # DROP FRAME explicitly to avoid latency buildup
+                        continue
+                        
+                    is_processing_video = True
                     try:
                         # Optimization: Offload to ThreadPoolExecutor for real parallel processing
                         result = await loop.run_in_executor(self.executor, self.video_mod.moderate_frame, payload)
@@ -46,6 +53,8 @@ class WebSocketHandler:
                     except Exception as e:
                         logging.error(f"Error moderating video frame: {e}")
                         await websocket.send_json({"error": f"Error moderating video frame: {str(e)}"})
+                    finally:
+                        is_processing_video = False
                     
                 elif msg_type == "audio_chunk":
                     try:

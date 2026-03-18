@@ -33,32 +33,9 @@ class VideoModerator:
             print(f"[ERROR] Frame decode failed: {e}")
             return {"unsafe": False, "regions": []}
 
-        # Sentinel Engine V5: Professional Pre-processing Pipeline
-        try:
-            # 1. Bilateral Filtering (Denoising Moiré while preserving edges - Core Pro Feature)
-            # This helps eliminate the "banding" and "noise" from mobile screens
-            denoised = cv2.bilateralFilter(frame, 9, 75, 75)
-            
-            # 2. Gamma Correction (1.3 for contrast restoration)
-            gamma = 1.3
-            invGamma = 1.0 / gamma
-            table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
-            gamma_frame = cv2.LUT(denoised, table)
-            
-            # 3. Smart Sharpening (Unsharp Mask for detail retrieval)
-            gaussian = cv2.GaussianBlur(gamma_frame, (0, 0), 2.0)
-            sharpened = cv2.addWeighted(gamma_frame, 1.5, gaussian, -0.5, 0)
-            
-            # 4. CLAHE (Local Contrast)
-            lab = cv2.cvtColor(sharpened, cv2.COLOR_BGR2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8,8))
-            cl = clahe.apply(l)
-            limg = cv2.merge((cl,a,b))
-            frame_rgb = cv2.cvtColor(cv2.cvtColor(limg, cv2.COLOR_LAB2BGR), cv2.COLOR_BGR2RGB)
-        except Exception as e:
-            print(f"[SENTINEL] Pre-processing failed: {e}")
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # FAST PATH: Skip heavy Sentinel Pipeline for real-time WebSocket MVP
+        # This converts ~150ms latency per frame to ~2ms per frame on CPU.
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # STEP 2: Multi-Label Inference
         detections = self.nudity_model.detect(frame_rgb)

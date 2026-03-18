@@ -1,19 +1,38 @@
-import React from 'react'
-import VideoCall from './components/VideoCall'
+import React from 'react';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { GoogleOAuthProvider } from '@react-oauth/google';
+import { AuthProvider } from './context/AuthContext';
+import LandingPage from './pages/LandingPage';
+import LoginPage from './pages/LoginPage';
+import Dashboard from './pages/Dashboard';
+import VideoCall from './components/VideoCall';
+import Room from './pages/Room';
+import ProtectedRoute from './components/ProtectedRoute';
 
 function App() {
-    return (
-        <div className="min-h-screen bg-zinc-950 text-white font-sans selection:bg-indigo-500/30">
-            <header className="p-6 border-b border-white/5 bg-zinc-900/50 backdrop-blur-xl">
-                <h1 className="text-2xl font-bold bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent">
-                    BlurNet AI Moderation
-                </h1>
-            </header>
-            <main className="container mx-auto p-6">
-                <VideoCall />
-            </main>
-        </div>
-    )
+  // Replace with your actual client ID! Currently using a placeholder
+  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID || "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com";
+  
+  return (
+    <GoogleOAuthProvider clientId={clientId}>
+      <AuthProvider>
+        <BrowserRouter>
+          <Routes>
+            <Route path="/" element={<LandingPage />} />
+            <Route path="/login" element={<LoginPage />} />
+            
+            <Route element={<ProtectedRoute />}>
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/call" element={<VideoCall />} />
+              <Route path="/room/:roomId" element={<Room />} />
+            </Route>
+
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </BrowserRouter>
+      </AuthProvider>
+    </GoogleOAuthProvider>
+  );
 }
 
-export default App
+export default App;

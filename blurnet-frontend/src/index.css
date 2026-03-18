@@ -1,4 +1,13 @@
-/* Tailwind-like utility styles for glassmorphism and layout */
+@import "tailwindcss";
+
+@theme {
+  --color-brand-primary: #2b6cee;
+  --color-brand-dark: #0f172a;
+  --color-brand-surface: #1e293b;
+  --radius-brand: 8px;
+}
+
+/* Custom utility styles for glassmorphism and layout */
 :root {
   font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.5;
@@ -98,4 +107,49 @@ body {
 .btn-danger {
   background: #ef4444;
   color: white;
+}
+
+/* Production UI Additions */
+.scanner-line {
+  height: 2px;
+  background: linear-gradient(90deg, transparent, #007bff, transparent);
+  box-shadow: 0 0 15px #007bff;
+  position: absolute;
+  width: 100%;
+  top: -10px;
+  animation: scan 4s infinite linear;
+  z-index: 10;
+}
+
+@keyframes scan {
+  0% { top: 0%; opacity: 0; }
+  10% { opacity: 1; }
+  90% { opacity: 1; }
+  100% { top: 100%; opacity: 0; }
+}
+
+.glass-panel {
+  background: rgba(15, 25, 35, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.audio-bar {
+  width: 3px;
+  background: #007bff;
+  border-radius: 1px;
+  transition: height 0.1s ease;
+}
+
+/* Scrollbar override for glass theme */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.1);
+  border-radius: 4px;
 }

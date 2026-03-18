@@ -1,12 +1,15 @@
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+import auth_router
 from models.nudity_model import NudityModel
 from models.speech_model import SpeechModel
 from models.abuse_model import AbuseModel
 from video_moderator import VideoModerator
 from audio_moderator import AudioModerator
 from websocket_handler import WebSocketHandler
+from meeting_signaling import MeetingSignalingServer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,6 +23,7 @@ abuse_model = AbuseModel()
 video_moderator = VideoModerator(nudity_model)
 audio_moderator = AudioModerator(speech_model, abuse_model)
 ws_handler = WebSocketHandler(video_moderator, audio_moderator)
+meeting_server = MeetingSignalingServer()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,6 +42,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router.router)
+
 @app.get("/")
 async def root():
     return {"status": "online", "message": "Moderation Engine is running"}
@@ -45,6 +59,11 @@ async def root():
 @app.websocket("/ws/moderate")
 async def websocket_endpoint(websocket: WebSocket):
     await ws_handler.handle(websocket)
+
+
+@app.websocket("/ws/room/{room_id}")
+async def room_websocket(websocket: WebSocket, room_id: str):
+    await meeting_server.handle(websocket, room_id)
 
 if __name__ == "__main__":
     import uvicorn

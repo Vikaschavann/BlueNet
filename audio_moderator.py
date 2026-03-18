@@ -24,28 +24,39 @@ class AudioModerator:
             print("[AUDIO] Skip: Buffer too small")
             return None
             
+        import tempfile
         # Whisper-faster expects a float32 array or a file path.
-        # We'll assume the client sends valid audio bytes (e.g. WAV or raw PCM).
-        # For simplicity in this engine, we'll use an in-memory buffer.
-        return io.BytesIO(audio_bytes)
+        # Tempfile allows robust FFmpeg parsing underneath (which faster-whisper uses).
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_audio:
+                temp_audio.write(audio_bytes)
+                return temp_audio.name
+        except Exception as e:
+            print(f"[AUDIO] Temp file creation failed: {e}")
+            return None
 
     def moderate_audio(self, base64_audio):
         """
         Transcribes audio and checks for abusive language.
         """
-        audio_file = self.decode_audio(base64_audio)
-        if audio_file is None:
+        import os
+        audio_file_path = self.decode_audio(base64_audio)
+        if audio_file_path is None:
             return {"abusive": False, "action": "allow", "text": ""}
         
         # 1. Transcribe with resilience for malformed headers
+        text = ""
         try:
-            text = self.speech_model.transcribe(audio_file)
+            text = self.speech_model.transcribe(audio_file_path)
         except Exception as e:
-            # This often happens when a partial audio chunk lacks headers (e.g. WebM "middle" chunks)
-            # We skip the chunk rather than crashing
-            # print(f"[AUDIO] Skip: Decoder failed (likely missing headers)")
-            return {"abusive": False, "action": "allow", "text": ""}
-        
+            pass # Skip partial chunk
+        finally:
+            if os.path.exists(audio_file_path):
+                try:
+                    os.remove(audio_file_path)
+                except Exception:
+                    pass
+
         if not text:
             return {"abusive": False, "action": "allow", "text": ""}
 

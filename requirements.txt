@@ -11,3 +11,4 @@ huggingface-hub
 python-multipart
 pydantic
 aiofiles
+PyJWT

@@ -40,10 +40,12 @@ export class VideoProcessor {
     setRegions(regions, maxScore = 0) {
         this.blurRegions = regions || [];
 
-        // HYBRID TRIGGER: Any detection causes immediate full-frame lockdown
-        if (this.blurRegions.length > 0) {
-            this.lockdownUntil = Date.now() + this.lockdownDuration;
-            this.shieldLife = this.maxShieldLife;
+        // TARGETED TRIGGER: Prevent 5-second full screen blindness on minor detections.
+        // We rely on the surgical WebGL blur for most things, but trigger a short 
+        // 800ms full-screen lockdown only if the AI is extremely confident (> 85%)
+        if (this.blurRegions.length > 0 && maxScore > 0.85) {
+            this.lockdownUntil = Date.now() + 800;
+            this.shieldLife = 5;
         }
     }
 
