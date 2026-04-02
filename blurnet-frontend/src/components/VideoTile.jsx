@@ -1,100 +1,96 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { VideoProcessor } from '../utils/VideoProcessor';
+import { UserRound, MicOff } from 'lucide-react';
 
 export default function VideoTile({
   label,
   stream,
   muted = false,
-  showModerated = false,
-  moderationSocket, // WebSocketClient-compatible: { send(type,data), isConnected }
   isActiveSpeaker = false,
+  hasRemoteVideo,
+  isRemoteAudioMuted
 }) {
   const videoRef = useRef(null);
-  const canvasRef = useRef(null);
-  const procRef = useRef(null);
-  const sendLoopRef = useRef(null);
-  const activeRef = useRef(false);
+  const [videoError, setVideoError] = useState('');
 
-  const [unsafe, setUnsafe] = useState(false);
+  // Determine if we should show fallback intelligently blending custom signals and native tracking
+  const hasVideo = hasRemoteVideo !== undefined 
+    ? hasRemoteVideo 
+    : (stream && stream.getVideoTracks().length > 0);
+    
+  const isAudioMuted = isRemoteAudioMuted !== undefined 
+    ? isRemoteAudioMuted 
+    : (stream && stream.getAudioTracks()[0] && !stream.getAudioTracks()[0].enabled);
 
   const tileBorder = useMemo(() => {
-    if (unsafe) return 'border-red-500 shadow-[0_0_30px_rgba(239,68,68,0.25)]';
     if (isActiveSpeaker) return 'border-emerald-500 shadow-[0_0_30px_rgba(16,185,129,0.18)]';
     return 'border-slate-800';
-  }, [unsafe, isActiveSpeaker]);
+  }, [isActiveSpeaker]);
 
+  // Failsafe UI Debug
   useEffect(() => {
-    if (!procRef.current) procRef.current = new VideoProcessor({ width: 640, height: 480 });
-    return () => {
-      procRef.current?.stopRenderLoop?.();
-    };
-  }, []);
-
-  useEffect(() => {
-    activeRef.current = Boolean(showModerated);
-  }, [showModerated]);
+    if (!stream || label === 'You') return;
+    const interval = setInterval(() => {
+      if (videoRef.current) {
+        if (!videoRef.current.srcObject) {
+          setVideoError('No remote stream received (srcObject null)');
+          console.error(`[VideoTile] ERROR: ${label} fail - srcObject is null`);
+        } else if (videoRef.current.readyState === 0) {
+          setVideoError('No remote stream received (readyState 0)');
+          console.error(`[VideoTile] ERROR: ${label} fail - readyState is 0 (HAVE_NOTHING)`);
+        } else {
+          setVideoError('');
+        }
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [stream, label]);
 
   useEffect(() => {
     if (!videoRef.current) return;
-    videoRef.current.srcObject = stream || null;
-  }, [stream, showModerated]);
 
-  useEffect(() => {
-    const proc = procRef.current;
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!proc || !video || !canvas) return;
+    if (!stream || !hasVideo) {
+      videoRef.current.srcObject = null;   // 🔥 FIX FREEZE
+      return;
+    }
 
-    if (showModerated) proc.startRenderLoop(video, canvas);
-    else proc.stopRenderLoop();
-  }, [showModerated, stream]);
+    if (videoRef.current.srcObject !== stream) {
+      videoRef.current.srcObject = stream;
+    }
 
-  const handleModerationMessage = (data) => {
-    if (data?.type !== 'moderation_result') return;
-    setUnsafe(Boolean(data.unsafe));
-    procRef.current?.setRegions?.(data.regions || [], data.max_score || 0);
-    if (sendLoopRef.current) setTimeout(sendLoopRef.current, 30);
-  };
-
-  // Lightweight per-tile moderation loop (sampled frames, drops when busy).
-  useEffect(() => {
-    if (!showModerated) return;
-    if (!moderationSocket) return;
-
-    // Wrap only once per tile by swapping the onMessage handler upstream is out-of-scope.
-    // So: we expect caller to route moderation results to this tile via `window` event.
-    const handler = (e) => handleModerationMessage(e.detail);
-    window.addEventListener(`moderation:${label}`, handler);
-
-    const sendNext = () => {
-      if (!activeRef.current) return;
-      if (!moderationSocket.isConnected) return;
-      const frame = procRef.current?.extractFrame?.(videoRef.current);
-      if (frame) moderationSocket.send('video_frame', frame);
-    };
-    sendLoopRef.current = sendNext;
-    setTimeout(sendNext, 600);
-
-    return () => {
-      window.removeEventListener(`moderation:${label}`, handler);
-      sendLoopRef.current = null;
-    };
-  }, [showModerated, moderationSocket, label]);
+    if (stream) {
+      // NOTE: Using muted={muted} prop in JSX instead of hardcoded true 
+      // dynamically prevents remote peers from being muted globally.
+      videoRef.current.onloadedmetadata = () => {
+        videoRef.current.play().catch(() => {});
+      };
+    }
+  }, [stream, hasVideo]);
 
   return (
-    <div className={`relative rounded-2xl overflow-hidden border bg-slate-900 ${tileBorder}`}>
-      <div className="absolute top-3 left-3 z-20 bg-black/40 backdrop-blur-md px-2.5 py-1 rounded-lg text-[11px] font-semibold">
+    <div className={`relative w-full h-full rounded-2xl overflow-hidden shadow-xl bg-slate-900 border transition-all duration-300 group ${tileBorder}`}>
+      {/* Name Tag */}
+      <div className="absolute bottom-3 left-3 z-20 bg-black/60 backdrop-blur-md px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-2 shadow-lg">
         {label}
+        {videoError && <span className="text-red-400 px-1 rounded">{videoError}</span>}
       </div>
 
-      {!showModerated ? (
-        <video ref={videoRef} className="w-full h-full object-cover" autoPlay playsInline muted={muted} />
-      ) : (
-        <>
-          <video ref={videoRef} className="absolute opacity-0 pointer-events-none w-[1px] h-[1px]" autoPlay playsInline muted={muted} />
-          <canvas ref={canvasRef} width={640} height={480} className="w-full h-full object-cover" />
-        </>
+      {/* Audio Muted Indicator */}
+      {(muted || isAudioMuted) && (
+        <div className="absolute top-3 right-3 z-20 bg-red-500/80 backdrop-blur-md p-1.5 rounded-full shadow-lg">
+          <MicOff className="w-4 h-4 text-white" />
+        </div>
       )}
+
+      {/* Avatar Fallback */}
+      {(!hasVideo || videoError) && (
+        <div className="absolute inset-0 flex items-center justify-center bg-slate-800 z-10">
+          <div className="w-24 h-24 rounded-full bg-slate-700 flex items-center justify-center shadow-inner">
+            <UserRound className="w-12 h-12 text-slate-500" />
+          </div>
+        </div>
+      )}
+
+      <video ref={videoRef} className="w-full h-full object-cover" autoPlay playsInline muted={muted} />
     </div>
   );
 }

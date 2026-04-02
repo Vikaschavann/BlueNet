@@ -138,6 +138,17 @@ class MeetingSignalingServer:
                         },
                     )
 
+                elif mtype == "media_state":
+                    # Broadcast the media toggle states directly to all other peers silently
+                    await self._broadcast(
+                        room_id,
+                        {
+                            "type": "media_state",
+                            "data": {"from": client_id, "state": data.get("state") or {}},
+                        },
+                        exclude=client_id,
+                    )
+
                 elif mtype == "reaction":
                     reaction = str(data.get("reaction") or "")[:32]
                     if not reaction:

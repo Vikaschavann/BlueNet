@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { GoogleLogin } from '@react-oauth/google';
 import { useAuth } from '../context/AuthContext';
 
@@ -12,6 +12,9 @@ const LoginPage = () => {
   
   const { login, signup, googleLogin } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
+
+  const from = location.state?.from?.pathname || '/dashboard';
 
   const handleEmailAuth = async (e) => {
     e.preventDefault();
@@ -22,7 +25,7 @@ const LoginPage = () => {
       } else {
         await signup(name, email, password);
       }
-      navigate('/dashboard');
+      navigate(from, { replace: true });
     } catch (err) {
       setError(err.response?.data?.detail || 'Authentication failed');
     }
@@ -31,7 +34,7 @@ const LoginPage = () => {
   const handleGoogleSuccess = async (credentialResponse) => {
     try {
       await googleLogin(credentialResponse.credential);
-      navigate('/dashboard');
+      navigate(from, { replace: true });
     } catch (err) {
       setError('Google authentication failed');
     }

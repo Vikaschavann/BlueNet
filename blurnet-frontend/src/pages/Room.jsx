@@ -1,10 +1,39 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+/**
+ * Refactored Room Component - Google Meet Style
+ * 
+ * KEY CHANGES:
+ * 1. NO getUserMedia() on page load
+ * 2. Join meeting WITHOUT media permissions (receive-only mode)
+ * 3. Request permissions only on-demand (user clicks "Enable Mic/Cam")
+ * 4. Create RTCPeerConnection without local tracks initially
+ * 5. Add tracks dynamically via addTrack/replaceTrack
+ * 
+ * USER FLOW:
+ * - Join room → Can see peers immediately (no permission prompt)
+ * - Click "Enable Camera" → Request camera permission
+ * - Click "Enable Mic" → Request mic permission
+ * - Click "Share Screen" → Request screen permission
+ * 
+ * If permission denied:
+ * - Show error toast
+ * - User can still see/hear others
+ * - Chat remains available
+ */
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
+import { Mic, MicOff, Video, VideoOff, MonitorUp, PhoneMissed, MessageSquare, ShieldAlert, UserRound } from 'lucide-react';
 import { RoomSocket } from '../utils/RoomSocket';
-import { createPeerConnection, ensureOffer } from '../utils/webrtcMesh';
+import { 
+  createPeerConnection, 
+  addFullMedia, 
+  replaceTrackOnSender 
+} from '../utils/webrtcMesh';
 import VideoTile from '../components/VideoTile';
 import { WebSocketClient } from '../utils/WebSocketClient';
 import { AudioProcessor } from '../utils/AudioProcessor';
+import { useMediaPermissions } from '../hooks/useMediaPermissions';
+import { VideoProcessor } from '../utils/VideoProcessor';
 
 function shortId() {
   const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -26,33 +55,158 @@ export default function Room() {
     [],
   );
 
+  // ============================================================================
+  // PERMISSION MANAGEMENT (lazy, on-demand)
+  // ============================================================================
+  const mediaPermissions = useMediaPermissions();
+  const [localStream, setLocalStream] = useState(null);
+  const [screenStream, setScreenStream] = useState(null);
+  const [toastMessage, setToastMessage] = useState('');
+  const [toastType, setToastType] = useState('info'); // info | error | success
+
+  const showToast = useCallback((message, type = 'info') => {
+    setToastMessage(message);
+    setToastType(type);
+    setTimeout(() => setToastMessage(''), 4000);
+  }, []);
+
+  // ============================================================================
+  // ROOM & SIGNALING STATE
+  // ============================================================================
   const roomSocketRef = useRef(null);
+  const [self, setSelf] = useState(null);
+  const [peers, setPeers] = useState([]);
+  const [connected, setConnected] = useState(false);
+  const [hasJoinedRoom, setHasJoinedRoom] = useState(false);
+  const selfRef = useRef(null);
+  const pendingPeerIdsRef = useRef(new Set());
+  const pendingSignalsRef = useRef(new Map());
+
+  // ============================================================================
+  // WEBRTC STATE
+  // ============================================================================
+  const pcsRef = useRef(new Map()); // peerId -> RTCPeerConnection
+  const sendersRef = useRef(new Map()); // peerId -> { audioSender, videoSender }
+  const politeRef = useRef(new Map()); // peerId -> boolean (for glare handling)
+  const rtcStateRef = useRef(new Map()); // peerId -> { makingOffer, polite }
+  const pendingIceRef = useRef(new Map());
+  const remoteStreamsRef = useRef(new Map());
+  const speakerAnalyzersRef = useRef(new Map());
+
+  // ============================================================================
+  // MODERATION & AUDIO & VIDEO
+  // ============================================================================
   const moderationWsRef = useRef(null);
   const audioProcRef = useRef(null);
+  
+  // Pipeline Refs for Sender-Side Security
+  const videoProcRef = useRef(null);
+  const rawVideoRef = useRef(null);
+  const processedCanvasRef = useRef(null);
+  const sendLoopRef = useRef(null);
+  const rawVideoTrackRef = useRef(null);
 
-  const [self, setSelf] = useState(null); // {id,isHost,displayName}
-  const [peers, setPeers] = useState([]); // [{id,displayName,isHost}]
-  const [streams, setStreams] = useState({}); // peerId -> MediaStream
-  const [localStream, setLocalStream] = useState(null);
-  const [connected, setConnected] = useState(false);
+  const [aiOn, setAiOn] = useState(true);
+  const [audioSanitized, setAudioSanitized] = useState(false);
+  
+  // Initialize AI Video Pipeline globally off-screen
+  useEffect(() => {
+    videoProcRef.current = new VideoProcessor({ width: 640, height: 480 });
+    
+    rawVideoRef.current = document.createElement('video');
+    rawVideoRef.current.muted = true;
+    rawVideoRef.current.playsInline = true;
+    
+    processedCanvasRef.current = document.createElement('canvas');
+    processedCanvasRef.current.width = 640;
+    processedCanvasRef.current.height = 480;
+
+    return () => {
+      videoProcRef.current?.stopRenderLoop?.();
+      clearInterval(sendLoopRef.current);
+    };
+  }, []);
+
+  // ============================================================================
+  // UI STATE
+  // ============================================================================
+  const [streams, setStreams] = useState({});
+  const [peerMediaState, setPeerMediaState] = useState({});
+  const [activeSpeakerId, setActiveSpeakerId] = useState(null);
   const [chatOpen, setChatOpen] = useState(false);
   const [chat, setChat] = useState([]);
   const [chatDraft, setChatDraft] = useState('');
-
-  const [micOn, setMicOn] = useState(true);
-  const [camOn, setCamOn] = useState(true);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
-  const [aiOn, setAiOn] = useState(true);
-  const [activeSpeakerId, setActiveSpeakerId] = useState(null);
-  const [audioSanitized, setAudioSanitized] = useState(false);
 
-  const pcsRef = useRef(new Map()); // peerId -> RTCPeerConnection
-  const sendersRef = useRef(new Map()); // peerId -> { audioSender, videoSender }
-  const politeRef = useRef(new Map()); // peerId -> boolean
-  const selfRef = useRef(null);
+  // Track what the user has enabled (independent of actual stream)
+  const [micEnabled, setMicEnabled] = useState(false);
+  const [cameraEnabled, setCameraEnabled] = useState(false);
 
-  // Active speaker detection (simple, local): choose the loudest remote track.
-  const speakerAnalyzersRef = useRef(new Map()); // peerId -> { ctx, analyser, data }
+  // ============================================================================
+  // EFFECTS: ROOM INITIALIZATION
+  // ============================================================================
+
+  // Auto-generate room ID if not provided
+  useEffect(() => {
+    if (!roomId) navigate(`/room/${shortId()}`, { replace: true });
+  }, [roomId, navigate]);
+
+
+
+  // Connect to signaling server (NO MEDIA ON LOAD)
+  useEffect(() => {
+    if (!roomId) return;
+
+    const roomSocket = new RoomSocket({
+      baseUrl: SIGNAL_BASE,
+      roomId,
+      onMessage: handleRoomMessage,
+    });
+    roomSocketRef.current = roomSocket;
+
+    // Connect to signaling immediately (no media needed)
+    (async () => {
+      try {
+        await roomSocket.connect();
+        console.log('[ROOM] Connected to signaling');
+        setConnected(true);
+      } catch (err) {
+        console.error('[ROOM] Signaling connection failed:', err);
+        showToast('Failed to join room', 'error');
+      }
+    })();
+
+    return () => {
+      roomSocket.disconnect();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, SIGNAL_BASE]);
+
+  // Connect to moderation WS
+  useEffect(() => {
+    const ws = new WebSocketClient(MODERATION_WS, (msg) => {
+      if (msg?.type === 'audio_result' && msg?.result?.abusive) {
+        setAudioSanitized(true);
+        // Temporarily mute mic
+        if (localStream) {
+          localStream.getAudioTracks().forEach((t) => (t.enabled = false));
+        }
+        setTimeout(() => {
+          setAudioSanitized(false);
+          if (localStream && micEnabled) {
+            localStream.getAudioTracks().forEach((t) => (t.enabled = true));
+          }
+        }, 2500);
+      }
+      if (msg?.type === 'moderation_result') {
+        videoProcRef.current?.setRegions?.(msg.regions || [], msg.max_score || 0);
+      }
+    });
+    moderationWsRef.current = ws;
+    return () => ws.disconnect();
+  }, [MODERATION_WS, micEnabled, localStream]);
+
+  // Active speaker detection
   useEffect(() => {
     const interval = setInterval(() => {
       let best = { id: null, score: 0.02 };
@@ -73,404 +227,908 @@ export default function Room() {
     return () => clearInterval(interval);
   }, []);
 
-  useEffect(() => {
-    if (!roomId) navigate(`/room/${shortId()}`, { replace: true });
-  }, [roomId, navigate]);
-
+  // Keep refs in sync with state
   useEffect(() => {
     selfRef.current = self;
   }, [self]);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 1280, height: 720 },
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      if (cancelled) return;
-      setLocalStream(stream);
-    })().catch((e) => {
-      console.error('[RTC] getUserMedia failed', e);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // ============================================================================
+  // WEBRTC: ROOM MESSAGE HANDLING
+  // ============================================================================
 
-  useEffect(() => {
-    if (!roomId) return;
-    const roomSocket = new RoomSocket({
-      baseUrl: SIGNAL_BASE,
-      roomId,
-      onMessage: (msg) => handleRoomMessage(msg),
-    });
-    roomSocketRef.current = roomSocket;
+  const handleRoomMessage = useCallback(
+    async (msg) => {
+      const type = msg?.type;
+      const data = msg?.data || {};
 
-    (async () => {
-      await roomSocket.connect();
-      setConnected(true);
-    })().catch((e) => console.error('[ROOM] connect failed', e));
-
-    return () => roomSocket.disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, SIGNAL_BASE]);
-
-  useEffect(() => {
-    const ws = new WebSocketClient(MODERATION_WS, (msg) => {
-      // Single moderation channel; currently routed to local tile only.
-      window.dispatchEvent(new CustomEvent('moderation:You', { detail: msg }));
-
-      if (msg?.type === 'audio_result' && msg?.result?.abusive) {
-        setAudioSanitized(true);
-        // "Beep/mute" MVP: temporarily mute mic to prevent further transmission.
-        if (localStream) localStream.getAudioTracks().forEach((t) => (t.enabled = false));
-        setTimeout(() => {
-          setAudioSanitized(false);
-          if (localStream) localStream.getAudioTracks().forEach((t) => (t.enabled = micOn));
-        }, 2500);
-      }
-    });
-    moderationWsRef.current = ws;
-    return () => ws.disconnect();
-  }, [MODERATION_WS, localStream, micOn]);
-
-  // Start audio moderation for local mic (optional).
-  useEffect(() => {
-    if (!localStream) return;
-    if (!aiOn) return;
-
-    let stopped = false;
-    (async () => {
-      await moderationWsRef.current?.connect?.();
-      if (stopped) return;
-      audioProcRef.current = new AudioProcessor((chunk) => {
-        moderationWsRef.current?.send?.('audio_chunk', chunk);
-      });
-      await audioProcRef.current.start(localStream);
-    })().catch((e) => console.warn('[AI] audio moderation init failed', e));
-
-    return () => {
-      stopped = true;
-      audioProcRef.current?.stop?.();
-    };
-  }, [localStream, aiOn]);
-
-  const handleRoomMessage = async (msg) => {
-    const type = msg?.type;
-    const data = msg?.data || {};
-
-    if (type === 'room_joined') {
-      setSelf(data.self);
-      setPeers(data.peers || []);
-      // Determine polite role per peer (prevents offer glare).
-      const selfId = data.self?.id;
-      (data.peers || []).forEach((p) => {
-        politeRef.current.set(p.id, selfId > p.id);
-      });
-      // Create PCs for existing peers (join late).
-      for (const p of data.peers || []) await ensurePeer(p.id);
-      return;
-    }
-
-    if (type === 'peer_joined') {
-      const p = data.peer;
-      setPeers((prev) => prev.some((x) => x.id === p.id) ? prev : [...prev, p]);
-      const curSelf = selfRef.current;
-      if (curSelf?.id) politeRef.current.set(p.id, curSelf.id > p.id);
-      await ensurePeer(p.id);
-      // If we are the "initiator" for this pair, create offer.
-      if (curSelf?.id && curSelf.id < p.id) await makeOfferTo(p.id);
-      return;
-    }
-
-    if (type === 'peer_left') {
-      const pid = data.peerId;
-      setPeers((prev) => prev.filter((p) => p.id !== pid));
-      setStreams((prev) => {
-        const copy = { ...prev };
-        delete copy[pid];
-        return copy;
-      });
-      closePeer(pid);
-      return;
-    }
-
-    if (type === 'signal') {
-      const from = data.from;
-      const payload = data.payload;
-      await handleSignal(from, payload);
-      return;
-    }
-
-    if (type === 'chat') {
-      setChat((prev) => [...prev, { from: data.from, text: data.text, ts: Date.now() }]);
-      return;
-    }
-  };
-
-  const ensurePeer = async (peerId) => {
-    if (!localStream) return;
-    if (pcsRef.current.has(peerId)) return;
-
-    const pc = createPeerConnection({
-      onIceCandidate: (candidate) => {
-        roomSocketRef.current?.send('signal', { to: peerId, payload: { candidate } });
-      },
-      onTrack: (e) => {
-        const [remoteStream] = e.streams;
-        if (!remoteStream) return;
-        setStreams((prev) => ({ ...prev, [peerId]: remoteStream }));
-
-        // Setup analyzer for active speaker (only if we have an audio track)
-        const audioTrack = remoteStream.getAudioTracks()[0];
-        if (audioTrack && !speakerAnalyzersRef.current.has(peerId)) {
-          const ctx = new (window.AudioContext || window.webkitAudioContext)();
-          const source = ctx.createMediaStreamSource(new MediaStream([audioTrack]));
-          const analyser = ctx.createAnalyser();
-          analyser.fftSize = 512;
-          const dataArr = new Uint8Array(analyser.fftSize);
-          source.connect(analyser);
-          speakerAnalyzersRef.current.set(peerId, { ctx, analyser, data: dataArr });
+      if (type === 'room_joined') {
+        setSelf(data.self);
+        setPeers(data.peers || []);
+        const selfId = data.self?.id;
+        (data.peers || []).forEach((p) => {
+          politeRef.current.set(p.id, selfId > p.id);
+        });
+        // Create PCs for existing peers (receive-only, no tracks yet)
+        for (const p of data.peers || []) {
+          ensurePeer(p.id);
         }
-      },
-    });
+        setHasJoinedRoom(true);
+        return;
+      }
 
-    // Add tracks
-    const audioTrack = localStream.getAudioTracks()[0];
-    const videoTrack = localStream.getVideoTracks()[0];
-    const audioSender = audioTrack ? pc.addTrack(audioTrack, localStream) : null;
-    const videoSender = videoTrack ? pc.addTrack(videoTrack, localStream) : null;
-    sendersRef.current.set(peerId, { audioSender, videoSender });
+      if (type === 'peer_joined') {
+        const p = data.peer;
+        setPeers((prev) => (prev.some((x) => x.id === p.id) ? prev : [...prev, p]));
+        const curSelf = selfRef.current;
+        if (curSelf?.id) politeRef.current.set(p.id, curSelf.id > p.id);
+        ensurePeer(p.id);
+        return;
+      }
 
-    pcsRef.current.set(peerId, pc);
-  };
+      if (type === 'peer_left') {
+        const pid = data.peerId;
+        setPeers((prev) => prev.filter((p) => p.id !== pid));
+        setStreams((prev) => {
+          const copy = { ...prev };
+          delete copy[pid];
+          return copy;
+        });
+        closePeer(pid);
+        return;
+      }
 
-  const closePeer = (peerId) => {
+      if (type === 'signal') {
+        const from = data.from;
+        const payload = data.payload;
+        handleSignal(from, payload);
+        return;
+      }
+
+      if (type === 'chat') {
+        setChat((prev) => [...prev, { from: data.from, text: data.text, ts: Date.now() }]);
+        return;
+      }
+
+      if (type === 'media_state') {
+        setPeerMediaState((prev) => ({
+          ...prev,
+          [data.from]: { ...prev[data.from], ...data.state }
+        }));
+        return;
+      }
+    },
+    [],
+  );
+
+  // ============================================================================
+  // WEBRTC: PEER CONNECTION MANAGEMENT
+  // ============================================================================
+
+  const ensurePeer = useCallback(
+    (peerId) => {
+      if (pcsRef.current.has(peerId)) return;
+
+      const polite = politeRef.current.get(peerId) ?? true;
+
+      // Create RECEIVE-ONLY PC (no tracks added yet)
+      const pc = createPeerConnection({
+        onIceCandidate: (candidate) => {
+          console.log(`[RTC] Sending ICE candidate to ${peerId}`);
+          roomSocketRef.current?.send('signal', { to: peerId, payload: { candidate } });
+        },
+        onTrack: (e) => {
+          const track = e.track;
+          console.log(`[RTC] ontrack fired for ${peerId}, kind: ${track.kind}`);
+          
+          // Accumulate tracks gracefully to accommodate standalone split stream topologies natively
+          setStreams((prev) => {
+            const existingStream = prev[peerId] || new MediaStream();
+            if (!existingStream.getTracks().includes(track)) {
+              existingStream.addTrack(track);
+            }
+            remoteStreamsRef.current.set(peerId, existingStream);
+            
+            // Setup speaker analyzer explicitly if an audio track arrives
+            if (track.kind === 'audio' && !speakerAnalyzersRef.current.has(peerId)) {
+              const ctx = new (window.AudioContext || window.webkitAudioContext)();
+              const source = ctx.createMediaStreamSource(new MediaStream([track]));
+              const analyser = ctx.createAnalyser();
+              analyser.fftSize = 512;
+              const dataArr = new Uint8Array(analyser.fftSize);
+              source.connect(analyser);
+              speakerAnalyzersRef.current.set(peerId, { ctx, analyser, data: dataArr });
+            }
+
+            return { ...prev, [peerId]: existingStream };
+          });
+        },
+      });
+
+      pc.oniceconnectionstatechange = () => {
+        console.log("ICE STATE:", pc.iceConnectionState);
+      };
+
+      pc.onconnectionstatechange = () => {
+        console.log("CONNECTION STATE:", pc.connectionState);
+      };
+
+      // Failsafe for stuck state logging
+      setTimeout(() => {
+        if (pc.iceConnectionState === 'checking') {
+          console.warn(`[RTC] WARNING: ICE stuck at 'checking' for ${peerId}. Potential STRICT firewall/symmetric NAT without valid TURN.`);
+        }
+      }, 10000);
+
+      rtcStateRef.current.set(peerId, { makingOffer: false, polite });
+
+      if (localStream) {
+        localStream.getTracks().forEach(track => {
+          pc.addTrack(track, localStream);
+        });
+      }
+
+      // Perfect negotiation
+      pc.onnegotiationneeded = async () => {
+        const state = rtcStateRef.current.get(peerId);
+        if (!state) return;
+        if (state.makingOffer) return;
+
+        try {
+          if (!roomSocketRef.current?.isConnected) return;
+
+          state.makingOffer = true;
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          console.log(`[RTC] Sending offer to ${peerId}`);
+          roomSocketRef.current?.send('signal', {
+            to: peerId,
+            payload: { description: pc.localDescription },
+          });
+        } catch (e) {
+          console.warn('[RTC] onnegotiationneeded failed:', e);
+        } finally {
+          state.makingOffer = false;
+        }
+      };
+
+      pcsRef.current.set(peerId, pc);
+      sendersRef.current.set(peerId, { audioSender: null, videoSender: null });
+
+      console.log(`[RTC] Created receive-only PC for ${peerId}`);
+    },
+    [],
+  );
+
+  const closePeer = useCallback((peerId) => {
     const pc = pcsRef.current.get(peerId);
     if (pc) {
-      try { pc.close(); } catch { /* noop */ }
+      try {
+        pc.close();
+      } catch {}
     }
     pcsRef.current.delete(peerId);
     sendersRef.current.delete(peerId);
+    rtcStateRef.current.delete(peerId);
+    pendingIceRef.current.delete(peerId);
+
+    const rs = remoteStreamsRef.current.get(peerId);
+    if (rs) {
+      try {
+        rs.getTracks().forEach((t) => t.stop());
+      } catch {}
+    }
+    remoteStreamsRef.current.delete(peerId);
 
     const ana = speakerAnalyzersRef.current.get(peerId);
     if (ana) {
-      try { ana.ctx.close(); } catch { /* noop */ }
+      try {
+        ana.ctx.close();
+      } catch {}
     }
     speakerAnalyzersRef.current.delete(peerId);
-  };
+  }, []);
 
-  const makeOfferTo = async (peerId) => {
+  const handleSignal = useCallback(
+    async (from, payload) => {
+      if (!roomSocketRef.current?.isConnected) return;
+
+      await ensurePeer(from);
+      const pc = pcsRef.current.get(from);
+      if (!pc) {
+        // Buffer for later
+        if (!pendingSignalsRef.current.has(from)) pendingSignalsRef.current.set(from, []);
+        pendingSignalsRef.current.get(from).push(payload);
+        return;
+      }
+
+      if (payload.description) {
+        const description = payload.description;
+        const state = rtcStateRef.current.get(from) || {
+          makingOffer: false,
+          polite: politeRef.current.get(from) ?? true,
+        };
+
+        const isOffer = description.type === 'offer';
+        const offerCollision = isOffer && (state.makingOffer || pc.signalingState !== 'stable');
+        const ignoreOffer = offerCollision && !state.polite;
+        if (ignoreOffer) {
+          console.log(`[RTC] Ignoring colliding offer from ${from}`);
+          return;
+        }
+
+        try {
+          await pc.setRemoteDescription(description);
+        } catch (err) {
+          console.error('[RTC] setRemoteDescription error:', err);
+          return;
+        }
+
+        // Flush buffered ICE
+        const queuedIce = pendingIceRef.current.get(from) || [];
+        if (queuedIce.length) {
+          console.log(`[RTC] Flushing ${queuedIce.length} queued ICE candidates for ${from}`);
+          pendingIceRef.current.delete(from);
+          for (const c of queuedIce) {
+            try {
+              await pc.addIceCandidate(c);
+            } catch (e) {
+              console.warn('[RTC] queued addIceCandidate failed:', e);
+            }
+          }
+        }
+
+        if (isOffer) {
+          try {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            console.log(`[RTC] Sending answer to ${from}`);
+            roomSocketRef.current?.send('signal', {
+              to: from,
+              payload: { description: pc.localDescription },
+            });
+          } catch (err) {
+            console.error('[RTC] createAnswer/setLocalDescription error:', err);
+          }
+        }
+      }
+
+      if (payload.candidate) {
+        console.log(`[RTC] Received ICE candidate from ${from}`);
+        try {
+          await pc.addIceCandidate(payload.candidate);
+        } catch (e) {
+          console.warn('[RTC] Delaying ICE candidate addition:', e);
+          const list = pendingIceRef.current.get(from) || [];
+          list.push(payload.candidate);
+          pendingIceRef.current.set(from, list);
+        }
+      }
+    },
+    [],
+  );
+
+  // ============================================================================
+  // PERMISSION MANAGEMENT & TRACK HELPERS
+  // ============================================================================
+
+  const renegotiate = useCallback(async (peerId) => {
     const pc = pcsRef.current.get(peerId);
     if (!pc) return;
-    const desc = await ensureOffer(pc);
-    roomSocketRef.current?.send('signal', { to: peerId, payload: { description: desc } });
-  };
-
-  const handleSignal = async (from, payload) => {
-    if (!localStream) return;
-    await ensurePeer(from);
-    const pc = pcsRef.current.get(from);
-    if (!pc) return;
-
-    if (payload.description) {
-      const description = payload.description;
-      const polite = politeRef.current.get(from) ?? true;
-      const offerCollision = description.type === 'offer' && (pc.signalingState !== 'stable');
-      if (offerCollision && !polite) return;
-
-      await pc.setRemoteDescription(description);
-      if (description.type === 'offer') {
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        roomSocketRef.current?.send('signal', { to: from, payload: { description: pc.localDescription } });
-      }
-    }
-
-    if (payload.candidate) {
-      try {
-        await pc.addIceCandidate(payload.candidate);
-      } catch (e) {
-        console.warn('[RTC] addIceCandidate failed', e);
-      }
-    }
-  };
-
-  const toggleMic = () => {
-    if (!localStream) return;
-    const next = !micOn;
-    setMicOn(next);
-    localStream.getAudioTracks().forEach((t) => (t.enabled = next));
-  };
-
-  const toggleCam = () => {
-    if (!localStream) return;
-    const next = !camOn;
-    setCamOn(next);
-    localStream.getVideoTracks().forEach((t) => (t.enabled = next));
-  };
-
-  const startScreenShare = async () => {
-    if (isScreenSharing) return;
     try {
-      const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      const state = rtcStateRef.current.get(peerId);
+      if (state) state.makingOffer = true;
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      roomSocketRef.current?.send('signal', {
+        to: peerId,
+        payload: { description: pc.localDescription },
+      });
+    } catch (e) {
+      console.warn('[RTC] FORCE renegotiate failed:', e);
+    } finally {
+      const state = rtcStateRef.current.get(peerId);
+      if (state) state.makingOffer = false;
+    }
+  }, []);
+
+  const addOrReplaceTrack = useCallback(async (peerId, track, stream) => {
+    const pc = pcsRef.current.get(peerId);
+    if (!pc) return { renegotiationNeeded: false };
+
+    // Standard fallback: match any transceiver that is structurally bound to this media kind
+    const transceiver = pc.getTransceivers().find(t => 
+      t.receiver.track?.kind === track.kind || t.sender.track?.kind === track.kind
+    );
+    
+    if (transceiver && transceiver.sender) {
+      await transceiver.sender.replaceTrack(track);
+      console.log(`[RTC] Replaced ${track.kind} track for peer ${peerId}`);
+      return { renegotiationNeeded: false };
+    } else {
+      pc.addTrack(track, stream);
+      console.log(`[RTC] Added ${track.kind} track to PC for peer ${peerId}`);
+      return { renegotiationNeeded: true };
+    }
+  }, []);
+
+  // ============================================================================
+  // MEDIA CONTROLS (FULLY DYNAMIC LIFECYCLE)
+  // ============================================================================
+
+  const toggleMic = useCallback(async () => {
+    if (!micEnabled) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const track = stream.getAudioTracks()[0];
+        console.log("Microphone track started");
+
+        let activeStream = localStream;
+        if (activeStream) {
+          activeStream.addTrack(track);
+          setLocalStream(new MediaStream(activeStream.getTracks()));
+        } else {
+          activeStream = stream;
+          setLocalStream(activeStream);
+        }
+
+        for (const peerId of pcsRef.current.keys()) {
+          const res = await addOrReplaceTrack(peerId, track, activeStream);
+          if (res?.renegotiationNeeded) {
+            renegotiate(peerId);
+          }
+        }
+
+        if (aiOn) {
+          await moderationWsRef.current?.connect?.();
+          audioProcRef.current = new AudioProcessor((chunk) => {
+            moderationWsRef.current?.send?.('audio_chunk', chunk);
+          });
+          await audioProcRef.current.start(activeStream);
+        }
+
+        setMicEnabled(true);
+        roomSocketRef.current?.send('media_state', { state: { audio: true } });
+        showToast('Mic on', 'success');
+      } catch (err) {
+        console.error('Mic error', err);
+        showToast('Mic access denied', 'error');
+      }
+    } else {
+      const audioTracks = localStream?.getAudioTracks() || [];
+      audioTracks.forEach((t) => {
+        t.stop();
+        if (localStream) localStream.removeTrack(t);
+        console.log("Microphone track stopped");
+      });
+
+      // MUST DO: Clear sender track to unfreeze remote peer without renegotiation
+      for (const peerId of pcsRef.current.keys()) {
+        const pc = pcsRef.current.get(peerId);
+        if (pc) {
+          const transceiver = pc.getTransceivers().find(t => 
+            t.receiver.track?.kind === 'audio' || t.sender.track?.kind === 'audio'
+          );
+          if (transceiver && transceiver.sender) {
+            transceiver.sender.replaceTrack(null).catch(e => console.warn('replaceTrack(null) failed', e));
+          }
+        }
+      }
+
+      if (localStream) {
+        setLocalStream(new MediaStream(localStream.getTracks()));
+      }
+
+      setMicEnabled(false);
+      roomSocketRef.current?.send('media_state', { state: { audio: false } });
+      showToast('Mic off', 'info');
+    }
+  }, [micEnabled, localStream, aiOn, addOrReplaceTrack, renegotiate, showToast]);
+
+  const toggleCamera = useCallback(async () => {
+    if (!cameraEnabled) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        const rawTrack = stream.getVideoTracks()[0];
+        console.log("Camera track started");
+
+        rawVideoTrackRef.current = rawTrack;
+
+        // Boot up hidden processing layer natively
+        rawVideoRef.current.srcObject = new MediaStream([rawTrack]);
+        await rawVideoRef.current.play().catch(() => {});
+        videoProcRef.current.startRenderLoop(rawVideoRef.current, processedCanvasRef.current);
+
+        // Capture proxy track implicitly
+        const processedStream = processedCanvasRef.current.captureStream(30);
+        const processedTrack = processedStream.getVideoTracks()[0];
+
+        // Start async interception sending loop safely
+        if (!sendLoopRef.current) {
+          sendLoopRef.current = setInterval(() => {
+            if (moderationWsRef.current?.isConnected) {
+              const frame = videoProcRef.current?.extractFrame?.(rawVideoRef.current);
+              if (frame) moderationWsRef.current.send('video_frame', frame);
+            }
+          }, 600);
+        }
+
+        let activeStream = localStream;
+        if (activeStream) {
+          activeStream.addTrack(processedTrack);
+          setLocalStream(new MediaStream(activeStream.getTracks()));
+        } else {
+          activeStream = new MediaStream([processedTrack]);
+          setLocalStream(activeStream);
+        }
+
+        // MANDATORY FIX: explicitly map to Send-Receive directly without wrappers
+        pcsRef.current.forEach((pc, peerId) => {
+          const sender = pc.getSenders().find(s => s.track?.kind === "video");
+
+          if (sender) {
+            console.log("Sender replaced:", sender);
+            sender.replaceTrack(processedTrack);
+          } else {
+            console.log("Sending processed track:", processedTrack);
+            // Must use processedStream as explicitly mandated
+            pc.addTrack(processedTrack, processedStream);
+            
+            // Ensure audio is preserved natively alongside it inside localStream context explicitly
+            const audioTrack = activeStream.getAudioTracks()[0];
+            if (audioTrack) {
+              const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
+              if (!audioSender) {
+                pc.addTrack(audioTrack, activeStream);
+              }
+            }
+          }
+          renegotiate(peerId);
+        });
+
+        setCameraEnabled(true);
+        roomSocketRef.current?.send('media_state', { state: { video: true } });
+        showToast('Camera on', 'success');
+      } catch (err) {
+        console.error('Camera error', err);
+        showToast('Camera access denied', 'error');
+      }
+    } else {
+      // Cleanly stop proxy interception loops
+      if (sendLoopRef.current) {
+        clearInterval(sendLoopRef.current);
+        sendLoopRef.current = null;
+      }
+      videoProcRef.current?.stopRenderLoop?.();
+
+      if (rawVideoTrackRef.current) {
+        rawVideoTrackRef.current.stop();
+        rawVideoTrackRef.current = null;
+      }
+
+      const videoTracks = localStream?.getVideoTracks() || [];
+      videoTracks.forEach((t) => {
+        t.stop();
+        if (localStream) localStream.removeTrack(t);
+        console.log("Camera track stopped");
+      });
+
+      // MUST DO: Clear sender track to instantly unfreeze remote peer video
+      for (const peerId of pcsRef.current.keys()) {
+        const pc = pcsRef.current.get(peerId);
+        if (pc) {
+          const transceiver = pc.getTransceivers().find(t => 
+            t.receiver.track?.kind === 'video' || t.sender.track?.kind === 'video'
+          );
+          if (transceiver && transceiver.sender) {
+            transceiver.sender.replaceTrack(null).catch(e => console.warn('replaceTrack(null) failed', e));
+          }
+        }
+        renegotiate(peerId);
+      }
+
+      if (localStream) {
+        setLocalStream(new MediaStream(localStream.getTracks()));
+      }
+
+      setCameraEnabled(false);
+      roomSocketRef.current?.send('media_state', { state: { video: false } });
+      showToast('Camera off', 'info');
+    }
+  }, [cameraEnabled, localStream, addOrReplaceTrack, renegotiate, showToast]);
+
+  const startScreenShare = useCallback(async () => {
+    if (isScreenSharing) return;
+
+    try {
+      const display = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: false,
+      });
       const screenTrack = display.getVideoTracks()[0];
       if (!screenTrack) return;
 
       setIsScreenSharing(true);
-      screenTrack.onended = () => stopScreenShare();
+      screenTrack.onended = stopScreenShare;
+      setScreenStream(display);
 
-      // Replace outgoing video track to all peers
-      sendersRef.current.forEach((senders) => {
-        senders.videoSender?.replaceTrack?.(screenTrack);
-      });
+      // Replace video track on all peers
+      for (const peerId of pcsRef.current.keys()) {
+        if (screenTrack) {
+          await addOrReplaceTrack(peerId, screenTrack, display);
+          renegotiate(peerId);
+        }
+      }
 
-    } catch (e) {
-      console.warn('[RTC] screenshare failed', e);
+      showToast('Screen sharing started', 'success');
+    } catch (err) {
+      console.warn('[RTC] Screen share failed:', err);
+      if (err.name !== 'NotAllowedError') {
+        showToast('Failed to start screen share', 'error');
+      }
     }
-  };
+  }, [isScreenSharing, showToast]);
 
-  const stopScreenShare = () => {
+  const stopScreenShare = useCallback(async () => {
     if (!isScreenSharing) return;
-    const camTrack = localStream?.getVideoTracks?.()[0];
-    if (camTrack) {
-      sendersRef.current.forEach((senders) => {
-        senders.videoSender?.replaceTrack?.(camTrack);
-      });
+
+    try {
+      const cameraVideoTrack = localStream?.getVideoTracks()[0];
+      if (cameraVideoTrack) {
+        // Restore camera
+        for (const peerId of pcsRef.current.keys()) {
+          await addOrReplaceTrack(peerId, cameraVideoTrack, localStream);
+          renegotiate(peerId);
+        }
+      }
+
+      screenStream?.getTracks?.().forEach((t) => t.stop());
+      setScreenStream(null);
+      setIsScreenSharing(false);
+      showToast('Screen sharing stopped', 'success');
+    } catch (err) {
+      console.warn('[RTC] Error stopping screen share:', err);
     }
-    setIsScreenSharing(false);
-  };
+  }, [isScreenSharing, localStream, screenStream, showToast]);
 
-  const sendChat = () => {
-    const text = chatDraft.trim();
-    if (!text) return;
-    roomSocketRef.current?.send('chat', { text });
-    setChatDraft('');
-  };
+  // ============================================================================
+  // CLEANUP & LEAVING
+  // ============================================================================
 
-  const leave = () => {
-    pcsRef.current.forEach((_, pid) => closePeer(pid));
-    localStream?.getTracks?.().forEach((t) => t.stop());
+  const leave = useCallback(() => {
+    // Close all peer connections
+    for (const [_, pc] of pcsRef.current.entries()) {
+      try {
+        pc.close();
+      } catch {}
+    }
+
+    // Stop all streams
+    try {
+      localStream?.getTracks().forEach((t) => t.stop());
+    } catch {}
+    try {
+      screenStream?.getTracks().forEach((t) => t.stop());
+    } catch {}
+
+    if (rawVideoTrackRef.current) {
+      rawVideoTrackRef.current.stop();
+    }
+    clearInterval(sendLoopRef.current);
+    videoProcRef.current?.stopRenderLoop?.();
+
+    // Cleanup
+    audioProcRef.current?.stop?.();
     roomSocketRef.current?.disconnect();
     moderationWsRef.current?.disconnect();
+
     navigate('/dashboard');
+  }, [localStream, screenStream, navigate]);
+
+  // ============================================================================
+  // RENDERING
+  // ============================================================================
+
+  // Separate local tile from remote tiles to power the PiP engine
+  const remoteTiles = useMemo(() => {
+    return peers.map((p) => ({
+      id: p.id,
+      label: p.displayName || p.id.slice(0, 6),
+      stream: streams[p.id] || null,
+      muted: false,
+      mediaState: peerMediaState[p.id] || {}
+    }));
+  }, [peers, streams, peerMediaState]);
+
+  const getGridClass = (count) => {
+    if (count === 0) return 'flex flex-col items-center justify-center';
+    if (count === 1) return 'grid-cols-1 max-w-5xl mx-auto w-full';
+    if (count === 2) return 'grid-cols-2 max-w-6xl mx-auto w-full';
+    if (count <= 4) return 'grid-cols-2 grid-rows-2 max-w-6xl mx-auto w-full';
+    if (count <= 6) return 'grid-cols-3 grid-rows-2 max-w-7xl mx-auto w-full';
+    return 'grid-cols-auto-fit min-[300px]'; // generic wrapping
   };
 
-  const shareLink = async () => {
-    const url = `${window.location.origin}/room/${roomId}`;
-    try {
-      await navigator.clipboard.writeText(url);
-    } catch {
-      // ignore
-    }
-  };
-
-  const tiles = useMemo(() => {
-    const out = [];
-    if (localStream) out.push({ id: 'local', label: 'You', stream: localStream, muted: true });
-    peers.forEach((p) => {
-      const s = streams[p.id];
-      if (s) out.push({ id: p.id, label: p.displayName || p.id.slice(0, 6), stream: s, muted: false });
-      else out.push({ id: p.id, label: p.displayName || p.id.slice(0, 6), stream: null, muted: false });
-    });
-    return out;
-  }, [localStream, peers, streams]);
+  const hasLocalMedia = cameraEnabled || micEnabled;
 
   return (
     <div className="h-screen bg-slate-950 text-white flex flex-col overflow-hidden">
+      {/* Header */}
       <div className="px-5 py-4 flex items-center justify-between border-b border-slate-900">
         <div className="flex items-center gap-3">
-          <div className="w-9 h-9 bg-brand-primary rounded-xl flex items-center justify-center font-black">B</div>
+          <div className="w-9 h-9 bg-brand-primary rounded-xl flex items-center justify-center font-black">
+            B
+          </div>
           <div>
             <div className="font-bold">BLURNET Meet</div>
             <div className="text-xs text-slate-400 flex items-center gap-2">
               <span className="font-mono">Room: {roomId}</span>
-              <button onClick={shareLink} className="text-brand-primary hover:underline">Copy link</button>
-              <span className={`ml-2 ${connected ? 'text-emerald-400' : 'text-slate-500'}`}>{connected ? 'Connected' : 'Connecting…'}</span>
+              <span
+                className={`ml-2 ${
+                  connected ? 'text-emerald-400' : 'text-slate-500'
+                }`}
+              >
+                {connected ? 'Connected' : 'Connecting…'}
+              </span>
             </div>
           </div>
         </div>
         <div className="flex items-center gap-3 text-sm">
-          <button onClick={() => setAiOn((v) => !v)} className={`px-3 py-1.5 rounded-xl border ${aiOn ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-slate-800 bg-slate-900 text-slate-400'}`}>
+          <button
+            onClick={() => setAiOn((v) => !v)}
+            className={`px-3 py-1.5 rounded-xl border ${
+              aiOn
+                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                : 'border-slate-800 bg-slate-900 text-slate-400'
+            }`}
+          >
             AI {aiOn ? 'On' : 'Off'}
           </button>
-          <button onClick={() => setChatOpen((v) => !v)} className="px-3 py-1.5 rounded-xl border border-slate-800 bg-slate-900 hover:bg-slate-800">
+          <button
+            onClick={() => setChatOpen((v) => !v)}
+            className="px-3 py-1.5 rounded-xl border border-slate-800 bg-slate-900 hover:bg-slate-800"
+          >
             Chat
           </button>
         </div>
       </div>
 
+      {/* Main Content */}
       <div className="flex-1 flex overflow-hidden">
-        <div className="flex-1 p-4">
-          {audioSanitized && (
-            <div className="mb-4 px-4 py-3 rounded-2xl border border-red-500/30 bg-red-500/10 text-red-200 font-semibold">
-              Audio sanitized (temporary mic mute)
+        {/* Video Grid */}
+        <div className="flex-1 p-4 flex flex-col">
+          {!connected ? (
+            <div className="flex-1 flex items-center justify-center">
+              <div className="text-center">
+                <div className="text-lg font-semibold mb-2">Connecting to room…</div>
+                <div className="text-slate-400">Please wait while we establish the connection</div>
+              </div>
+            </div>
+          ) : !hasJoinedRoom ? (
+            // Join-without-camera mode
+            <div className="flex-1 flex flex-col items-center justify-center gap-6">
+              <div className="text-center">
+                <div className="text-3xl font-bold mb-2">Ready to join?</div>
+                <div className="text-slate-400 mb-6">
+                  You can view and chat without enabling camera/microphone
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4">
+                <button
+                  onClick={() => setIsScreenSharing(!isScreenSharing)}
+                  className="px-6 py-4 bg-purple-500 hover:bg-purple-600 rounded-xl font-semibold transition"
+                >
+                  📺 Share Screen
+                </button>
+              </div>
+
+              <button
+                onClick={() => {}}
+                className="px-8 py-3 bg-slate-800 hover:bg-slate-700 rounded-xl font-semibold"
+              >
+                Just View (no media)
+              </button>
+
+              {peers.length > 0 && (
+                <div className="mt-6 text-center">
+                  <div className="text-sm text-slate-400">
+                    {peers.length} participant{peers.length !== 1 ? 's' : ''} already in this meeting
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            // Google Meet Dynamic Grid
+            <div className={`grid gap-4 w-full h-full p-6 place-items-center ${getGridClass(remoteTiles.length)}`}>
+              {remoteTiles.length === 0 ? (
+                <div className="flex flex-col items-center justify-center gap-4 text-slate-500">
+                  <div className="w-20 h-20 rounded-full bg-slate-800/50 flex items-center justify-center border border-slate-700/50">
+                    <UserRound className="w-10 h-10 text-slate-600" />
+                  </div>
+                  <h2 className="text-xl font-medium text-slate-300">You're the only one here</h2>
+                  <p className="text-sm">Waiting for others to join...</p>
+                </div>
+              ) : (
+                remoteTiles.map((t) => (
+                  <div key={t.id} className="w-full h-full min-h-[250px] max-h-[80vh] aspect-video">
+                    <VideoTile
+                      label={t.label}
+                      stream={t.stream}
+                      muted={t.muted}
+                      isActiveSpeaker={t.id === activeSpeakerId}
+                      hasRemoteVideo={t.mediaState?.video}
+                      isRemoteAudioMuted={t.mediaState?.audio === false}
+                    />
+                  </div>
+                ))
+              )}
             </div>
           )}
-          <div className="grid gap-4" style={{ gridTemplateColumns: tiles.length <= 2 ? '1fr 1fr' : 'repeat(3, minmax(0, 1fr))' }}>
-            {tiles.map((t) => (
-              <VideoTile
-                key={t.id}
-                label={t.label}
-                stream={t.stream}
-                muted={t.muted}
-                showModerated={aiOn && t.id === 'local'}
-                moderationSocket={moderationWsRef.current}
-                isActiveSpeaker={t.id !== 'local' && t.id === activeSpeakerId}
-              />
-            ))}
-          </div>
         </div>
 
-        {chatOpen && (
-          <div className="w-[360px] border-l border-slate-900 bg-slate-950 flex flex-col">
-            <div className="px-4 py-3 border-b border-slate-900 font-semibold">Meeting chat</div>
-            <div className="flex-1 overflow-auto px-4 py-3 space-y-3">
-              {chat.map((m, idx) => (
-                <div key={idx} className="text-sm">
-                  <div className="text-xs text-slate-500 font-mono">{m.from === self?.id ? 'you' : m.from?.slice(0, 6)}</div>
-                  <div className="text-slate-200">{m.text}</div>
+      </div>
+
+      {/* Slide-in Chat Panel */}
+      <div className={`fixed right-0 top-0 bottom-0 w-80 bg-slate-900 border-l border-slate-800/50 flex flex-col z-40 transform transition-transform duration-300 ease-out shadow-2xl ${chatOpen ? 'translate-x-0' : 'translate-x-full'}`}>
+        <div className="px-5 py-4 border-b border-slate-800/50 flex justify-between items-center bg-slate-900/50 backdrop-blur">
+          <span className="font-semibold flex items-center gap-2"><MessageSquare className="w-4 h-4"/> Meeting Chat</span>
+          <button onClick={() => setChatOpen(false)} className="text-slate-400 hover:text-white text-xl">&times;</button>
+        </div>
+        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+          {chat.length === 0 ? (
+            <div className="text-center text-slate-500 text-sm mt-10">Messages will appear here</div>
+          ) : (
+            chat.map((m, idx) => {
+              const isSelf = m.from === self?.id;
+              return (
+                <div key={idx} className={`flex flex-col max-w-[85%] ${isSelf ? 'ml-auto items-end' : 'items-start'}`}>
+                  <span className="text-[10px] text-slate-400 mb-1 px-1">{isSelf ? 'You' : m.from?.slice(0, 6)}</span>
+                  <div className={`px-4 py-2 text-sm rounded-2xl ${
+                    isSelf 
+                      ? 'bg-blue-600 text-white rounded-br-sm' 
+                      : 'bg-slate-800 text-slate-200 rounded-bl-sm border border-slate-700/50'
+                  }`}>
+                    {m.text}
+                  </div>
                 </div>
-              ))}
-            </div>
-            <div className="p-3 border-t border-slate-900 flex gap-2">
-              <input
-                value={chatDraft}
-                onChange={(e) => setChatDraft(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && sendChat()}
-                className="flex-1 bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 outline-none"
-                placeholder="Message everyone"
-              />
-              <button onClick={sendChat} className="px-3 py-2 rounded-xl bg-brand-primary font-semibold hover:bg-blue-600">
-                Send
-              </button>
-            </div>
+              );
+            })
+          )}
+        </div>
+        <div className="p-4 bg-slate-900/90 backdrop-blur border-t border-slate-800/50">
+          <div className="flex gap-2 bg-slate-950 p-1.5 rounded-xl border border-slate-800">
+            <input
+              value={chatDraft}
+              onChange={(e) => setChatDraft(e.target.value)}
+              onKeyDown={(e) =>
+                e.key === 'Enter' &&
+                chatDraft.trim() &&
+                (roomSocketRef.current?.send('chat', { text: chatDraft }), setChatDraft(''))
+              }
+              className="flex-1 bg-transparent px-3 outline-none text-sm placeholder:text-slate-500"
+              placeholder="Message everyone..."
+            />
+            <button
+              onClick={() => {
+                if (chatDraft.trim()) {
+                  roomSocketRef.current?.send('chat', { text: chatDraft });
+                  setChatDraft('');
+                }
+              }}
+              className="p-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+            >
+              <MessageSquare className="w-4 h-4" />
+            </button>
           </div>
-        )}
-      </div>
-
-      <div className="p-5 flex justify-center border-t border-slate-900">
-        <div className="bg-slate-900/70 backdrop-blur-xl border border-slate-800 rounded-2xl px-6 py-3 flex items-center gap-3 shadow-2xl">
-          <button onClick={toggleMic} className={`px-4 py-2 rounded-xl font-semibold ${micOn ? 'bg-slate-800 hover:bg-slate-700' : 'bg-red-500 hover:bg-red-600'}`}>
-            {micOn ? 'Mic on' : 'Mic off'}
-          </button>
-          <button onClick={toggleCam} className={`px-4 py-2 rounded-xl font-semibold ${camOn ? 'bg-slate-800 hover:bg-slate-700' : 'bg-red-500 hover:bg-red-600'}`}>
-            {camOn ? 'Cam on' : 'Cam off'}
-          </button>
-          <button
-            onClick={() => (isScreenSharing ? stopScreenShare() : startScreenShare())}
-            className={`px-4 py-2 rounded-xl font-semibold ${isScreenSharing ? 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/30' : 'bg-slate-800 hover:bg-slate-700'}`}
-          >
-            {isScreenSharing ? 'Stop share' : 'Share screen'}
-          </button>
-          <div className="w-px h-8 bg-slate-800 mx-1" />
-          <button onClick={leave} className="px-5 py-2 rounded-xl bg-red-500 hover:bg-red-600 font-black">
-            Leave
-          </button>
         </div>
       </div>
+
+      {/* Floating Control Bar */}
+      {hasJoinedRoom && (
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-slate-900/80 backdrop-blur-2xl border border-slate-700/50 rounded-full px-6 py-4 shadow-2xl z-50 transition-all duration-300">
+          <button
+            onClick={toggleMic}
+            className={`group relative p-4 rounded-full transition-all duration-200 ${
+              micEnabled && localStream?.getAudioTracks()[0]?.enabled
+                ? 'bg-slate-800 hover:bg-slate-700'
+                : 'bg-red-500 hover:bg-red-600'
+            }`}
+          >
+            {micEnabled && localStream?.getAudioTracks()[0]?.enabled ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5 text-white" />}
+            <span className="absolute -top-10 left-1/2 -translate-x-1/2 bg-slate-800 mb-2 text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none">
+              Toggle Mic
+            </span>
+          </button>
+          
+          <button
+            onClick={toggleCamera}
+            className={`group relative p-4 rounded-full transition-all duration-200 ${
+              cameraEnabled && localStream?.getVideoTracks()[0]?.enabled
+                ? 'bg-slate-800 hover:bg-slate-700'
+                : 'bg-red-500 hover:bg-red-600'
+            }`}
+          >
+            {cameraEnabled && localStream?.getVideoTracks()[0]?.enabled ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5 text-white" />}
+            <span className="absolute -top-10 left-1/2 -translate-x-1/2 bg-slate-800 mb-2 text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none">
+              Toggle Camera
+            </span>
+          </button>
+
+          <button
+            onClick={isScreenSharing ? stopScreenShare : startScreenShare}
+            className={`group relative p-4 rounded-full transition-all duration-200 ${
+              isScreenSharing
+                ? 'bg-emerald-500 text-white'
+                : 'bg-slate-800 hover:bg-slate-700'
+            }`}
+          >
+            <MonitorUp className="w-5 h-5" />
+            <span className="absolute -top-10 left-1/2 -translate-x-1/2 bg-slate-800 mb-2 text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none">
+              {isScreenSharing ? 'Stop Sharing' : 'Share Screen'}
+            </span>
+          </button>
+
+          <div className="w-px h-8 bg-slate-700/50 mx-2" />
+
+          <button
+            onClick={() => setChatOpen(!chatOpen)}
+            className={`group relative p-4 rounded-full transition-all duration-200 ${
+              chatOpen ? 'bg-blue-600 text-white' : 'bg-slate-800 hover:bg-slate-700'
+            }`}
+          >
+            <MessageSquare className="w-5 h-5" />
+            <span className="absolute -top-10 left-1/2 -translate-x-1/2 bg-slate-800 mb-2 text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none">
+              Chat
+            </span>
+          </button>
+
+          <button
+            onClick={leave}
+            className="group relative p-4 rounded-full bg-red-600 hover:bg-red-700 transition-all duration-200 shadow-lg shadow-red-500/20"
+          >
+            <PhoneMissed className="w-5 h-5 text-white" />
+            <span className="absolute -top-10 left-1/2 -translate-x-1/2 bg-slate-800 mb-2 text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none">
+              Leave Call
+            </span>
+          </button>
+        </div>
+      )}
+
+      {/* Picture-in-Picture Local Viewer */}
+      {hasJoinedRoom && cameraEnabled && localStream && (
+        <div className="fixed bottom-28 right-6 w-64 aspect-video rounded-2xl shadow-2xl border border-slate-700/50 bg-slate-900 z-40 overflow-hidden transform hover:scale-105 transition-transform cursor-pointer">
+          <VideoTile
+            label="You"
+            stream={localStream}
+            muted={true}
+            showModerated={aiOn}
+            moderationSocket={moderationWsRef.current}
+            isActiveSpeaker={false}
+          />
+        </div>
+      )}
+
+      {/* Toast Notifications */}
+      {toastMessage && (
+        <div
+          className={`fixed bottom-6 right-6 px-4 py-3 rounded-xl font-semibold backdrop-blur-xl border ${
+            toastType === 'error'
+              ? 'bg-red-500/20 border-red-500/50 text-red-200'
+              : toastType === 'success'
+                ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-200'
+                : 'bg-blue-500/20 border-blue-500/50 text-blue-200'
+          }`}
+        >
+          {toastMessage}
+        </div>
+      )}
+
+      {/* Audio Sanitized Banner */}
+      {audioSanitized && (
+        <div className="px-5 py-2 bg-red-500/10 border-b border-red-500/30 text-red-200 text-sm font-semibold">
+          ⚠️ Audio sanitized (temporary mic mute due to content moderation)
+        </div>
+      )}
     </div>
   );
 }
-
