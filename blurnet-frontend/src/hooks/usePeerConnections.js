@@ -1,14 +1,8 @@
 /**
- * usePeerConnections Hook
- * 
- * Manages RTCPeerConnection lifecycle with LAZY track addition:
- * - Create PC without local tracks initially (receive-only mode)
- * - Add local tracks via addLocalTracks() only after permissions granted
- * - Handle track replacement (for camera toggle, screen share, etc.)
- * - Graceful cleanup
+ * Production-ready WebRTC Peer Connection Hook (Google Meet style)
+ * Goal: Seamless switching, zero black screens, remote stream updates natively
  */
-
-import { useCallback, useRef } from 'react';
+import { useCallback, useRef, useState, useEffect } from 'react';
 
 const DEFAULT_RTC_CONFIG = {
   iceServers: [
@@ -16,176 +10,246 @@ const DEFAULT_RTC_CONFIG = {
   ],
 };
 
-export function usePeerConnections() {
-  const pcsRef = useRef(new Map()); // peerId -> RTCPeerConnection
-  const sendersRef = useRef(new Map()); // peerId -> { audioSender, videoSender }
+export function usePeerConnections({ sendSignal, onRemoteTrack }) {
+  const pcsRef = useRef(new Map());
+  const rtcStateRef = useRef(new Map()); // { makingOffer, polite }
+  
+  const [localStream, setLocalStream] = useState(null);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [cameraEnabled, setCameraEnabled] = useState(false);
+
+  const rawCameraTrackRef = useRef(null);
+  const screenTrackRef = useRef(null);
+  
+  useEffect(() => {
+    return () => closeAll();
+  }, []);
 
   /**
-   * Create a new peer connection (receive-only initially, no tracks)
+   * 1. TRACK MANAGEMENT (CRITICAL)
+   * Maintain single video sender. Use replaceTrack() instead of adding tracks.
    */
-  const createPeerConnection = useCallback((peerId, { onIceCandidate, onTrack, rtcConfig = DEFAULT_RTC_CONFIG }) => {
-    if (pcsRef.current.has(peerId)) {
-      console.warn(`[RTC] PeerConnection already exists for ${peerId}`);
-      return pcsRef.current.get(peerId);
+  const replaceTrackOnPeers = useCallback(async (trackKind, newTrack, stream) => {
+    for (const [peerId, pc] of pcsRef.current.entries()) {
+      let transceiver = pc.getTransceivers().find(t => 
+        !t.stopped && (t.receiver?.track?.kind === trackKind || t.sender?.track?.kind === trackKind)
+      );
+
+      if (transceiver && transceiver.sender) {
+        try {
+          // Use replaceTrack! Avoids renegotiation overhead entirely if direction is unchanged
+          await transceiver.sender.replaceTrack(newTrack || null);
+          console.log(`[RTC] Replaced ${trackKind} track for peer ${peerId}`);
+          
+          if (newTrack) {
+            if (transceiver.direction === 'recvonly') transceiver.direction = 'sendrecv';
+            else if (transceiver.direction === 'inactive') transceiver.direction = 'sendonly';
+          } else {
+            // Mute scenario
+            if (transceiver.direction === 'sendrecv') transceiver.direction = 'recvonly';
+            else if (transceiver.direction === 'sendonly') transceiver.direction = 'inactive';
+          }
+        } catch (e) {
+          console.error(`[RTC] replaceTrack failed for ${peerId}:`, e);
+        }
+      } else if (newTrack && stream) {
+        pc.addTrack(newTrack, stream);
+        console.log(`[RTC] Added ${trackKind} track to PC for peer ${peerId}`);
+      }
     }
+  }, []);
 
-    const pc = new RTCPeerConnection(rtcConfig);
+  /**
+   * 2. SIGNALING + RENEGOTIATION
+   */
+  const createPeerConnection = useCallback((peerId, polite) => {
+    if (pcsRef.current.has(peerId)) return pcsRef.current.get(peerId);
 
-    // Handle ICE candidates
+    const pc = new RTCPeerConnection(DEFAULT_RTC_CONFIG);
+    rtcStateRef.current.set(peerId, { makingOffer: false, polite });
+
     pc.onicecandidate = (e) => {
-      if (e.candidate && onIceCandidate) {
-        onIceCandidate(peerId, e.candidate);
-      }
+      if (e.candidate) sendSignal(peerId, { candidate: e.candidate });
     };
 
-    // Handle receiving remote tracks
     pc.ontrack = (e) => {
-      console.log(`[RTC] Received track from ${peerId}:`, e.track.kind);
-      if (onTrack) {
-        onTrack(peerId, e);
+      // Pass the remote stream efficiently
+      if (onRemoteTrack) onRemoteTrack(peerId, e.track, e.streams[0]);
+    };
+
+    // Handle negotiationneeded elegantly (only fires when sender direction explicitly changes bounds)
+    pc.onnegotiationneeded = async () => {
+      const state = rtcStateRef.current.get(peerId);
+      if (!state || state.makingOffer) return;
+      try {
+        state.makingOffer = true;
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        sendSignal(peerId, { description: pc.localDescription });
+      } catch (err) {
+        console.error('[RTC] onnegotiationneeded error:', err);
+      } finally {
+        state.makingOffer = false;
       }
     };
 
-    pc.onconnectionstatechange = () => {
-      console.log(`[RTC] ${peerId} connection state: ${pc.connectionState}`);
-    };
+    if (localStream) {
+      localStream.getTracks().forEach(track => {
+        pc.addTrack(track, localStream);
+      });
+    }
 
     pcsRef.current.set(peerId, pc);
-    sendersRef.current.set(peerId, { audioSender: null, videoSender: null });
-
-    console.log(`[RTC] Created receive-only PeerConnection for ${peerId}`);
     return pc;
-  }, []);
+  }, [localStream, sendSignal, onRemoteTrack]);
 
-  /**
-   * Add local tracks to an existing PC (call after getUserMedia)
-   * Replaces existing tracks if already present
-   */
-  const addLocalTracks = useCallback((peerId, localStream) => {
+  const handleSignal = useCallback(async (peerId, payload) => {
     const pc = pcsRef.current.get(peerId);
-    if (!pc) {
-      console.error(`[RTC] No PeerConnection for ${peerId}`);
-      return;
-    }
+    if (!pc) return;
 
-    if (!localStream) {
-      console.warn(`[RTC] No local stream provided for ${peerId}`);
-      return;
-    }
+    if (payload.description) {
+      const state = rtcStateRef.current.get(peerId);
+      const isOffer = payload.description.type === 'offer';
+      const offerCollision = isOffer && (state.makingOffer || pc.signalingState !== 'stable');
+      if (offerCollision && !state.polite) return;
 
-    const senders = sendersRef.current.get(peerId) || {};
-    let audioSender = senders.audioSender;
-    let videoSender = senders.videoSender;
-
-    // Add or replace audio track
-    const audioTrack = localStream.getAudioTracks()[0];
-    if (audioTrack) {
-      if (audioSender) {
-        // Replace existing audio track
-        audioSender.replaceTrack(audioTrack).catch((err) => {
-          console.warn(`[RTC] Failed to replace audio track for ${peerId}:`, err);
-        });
-      } else {
-        // Add new audio sender
-        audioSender = pc.addTrack(audioTrack, localStream);
-        console.log(`[RTC] Added audio track to ${peerId}`);
+      await pc.setRemoteDescription(payload.description);
+      if (isOffer) {
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        sendSignal(peerId, { description: pc.localDescription });
+      }
+    } else if (payload.candidate) {
+      try {
+        await pc.addIceCandidate(payload.candidate);
+      } catch (e) {
+        console.warn('[RTC] ICE candidate error:', e);
       }
     }
-
-    // Add or replace video track
-    const videoTrack = localStream.getVideoTracks()[0];
-    if (videoTrack) {
-      if (videoSender) {
-        // Replace existing video track
-        videoSender.replaceTrack(videoTrack).catch((err) => {
-          console.warn(`[RTC] Failed to replace video track for ${peerId}:`, err);
-        });
-      } else {
-        // Add new video sender
-        videoSender = pc.addTrack(videoTrack, localStream);
-        console.log(`[RTC] Added video track to ${peerId}`);
-      }
-    }
-
-    sendersRef.current.set(peerId, { audioSender, videoSender });
-    console.log(`[RTC] Local tracks added for ${peerId}`);
-  }, []);
+  }, [sendSignal]);
 
   /**
-   * Replace a specific track (e.g., for screen share or camera toggle)
+   * 3. CAMERA HANDLING
+   * Get camera using getUserMedia & Add track safely
    */
-  const replaceTrack = useCallback((peerId, newTrack) => {
-    const senders = sendersRef.current.get(peerId);
-    if (!senders || !newTrack) {
-      console.warn(`[RTC] Cannot replace track for ${peerId}`);
-      return;
-    }
+  const initCamera = useCallback(async () => {
+    if (cameraEnabled) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      rawCameraTrackRef.current = stream.getVideoTracks()[0];
+      
+      setLocalStream(stream);
+      setCameraEnabled(true);
 
-    const sender =
-      newTrack.kind === 'audio' ? senders.audioSender : senders.videoSender;
-    if (!sender) {
-      console.warn(`[RTC] No ${newTrack.kind} sender for ${peerId}`);
-      return;
-    }
-
-    sender
-      .replaceTrack(newTrack)
-      .then(() => {
-        console.log(`[RTC] Replaced ${newTrack.kind} track for ${peerId}`);
-      })
-      .catch((err) => {
-        console.warn(`[RTC] Failed to replace ${newTrack.kind} track for ${peerId}:`, err);
+      stream.getTracks().forEach(async t => {
+        await replaceTrackOnPeers(t.kind, t, stream);
       });
-  }, []);
+    } catch (err) {
+      console.error("[RTC] initCamera failed", err);
+    }
+  }, [cameraEnabled, replaceTrackOnPeers]);
 
-  /**
-   * Get all active peer connections
+  /* 
+   * 4. SWITCH BACK TO CAMERA 
    */
-  const getAllPeerConnections = useCallback(() => {
-    return Array.from(pcsRef.current.entries());
-  }, []);
+  const stopScreenShare = useCallback(async () => {
+    if (!isScreenSharing) return;
+    
+    setIsScreenSharing(false);
 
-  /**
-   * Close a specific peer connection
-   */
-  const closePeerConnection = useCallback((peerId) => {
-    const pc = pcsRef.current.get(peerId);
-    if (pc) {
-      try {
-        pc.close();
-        console.log(`[RTC] Closed PeerConnection for ${peerId}`);
-      } catch (err) {
-        console.warn(`[RTC] Error closing PC for ${peerId}:`, err);
+    try {
+      if (cameraEnabled) {
+        console.log('[RTC] Re-acquiring camera using getUserMedia...');
+        const newStream = await navigator.mediaDevices.getUserMedia({ video: true });
+        const newVideoTrack = newStream.getVideoTracks()[0];
+        
+        if (rawCameraTrackRef.current) rawCameraTrackRef.current.stop();
+        rawCameraTrackRef.current = newVideoTrack;
+
+        const audioTracks = localStream ? localStream.getAudioTracks() : [];
+        const combinedStream = new MediaStream([...audioTracks, newVideoTrack]);
+        setLocalStream(combinedStream);
+
+        // Replace back using replaceTrack BEFORE ending the screen share natively
+        await replaceTrackOnPeers('video', newVideoTrack, combinedStream);
+      } else {
+        // Safe mute
+        await replaceTrackOnPeers('video', null, null);
+        const audioTracks = localStream ? localStream.getAudioTracks() : [];
+        setLocalStream(audioTracks.length > 0 ? new MediaStream(audioTracks) : null);
+      }
+    } catch (err) {
+      console.error('[RTC] Error restoring camera:', err);
+      setCameraEnabled(false);
+    } finally {
+      // AVOID MISUSE: Destruct screen track ONLY AFTER replacement is piped securely!
+      // This prevents RTCRtpSender from trying to transmit a permanently killed dead canvas/display!
+      if (screenTrackRef.current) {
+        screenTrackRef.current.onended = null;
+        screenTrackRef.current.stop();
+        screenTrackRef.current = null;
       }
     }
-    pcsRef.current.delete(peerId);
-    sendersRef.current.delete(peerId);
-  }, []);
+  }, [isScreenSharing, cameraEnabled, localStream, replaceTrackOnPeers]);
 
   /**
-   * Close all peer connections
+   * 5. SCREEN SHARE HANDLING
    */
+  const startScreenShare = useCallback(async () => {
+    if (isScreenSharing) return;
+
+    try {
+      const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      const screenTrack = display.getVideoTracks()[0];
+      if (!screenTrack) return;
+
+      screenTrackRef.current = screenTrack;
+      // Edge Case: User cancels via browser UI natively
+      screenTrack.onended = stopScreenShare;
+
+      // DO NOT STOP camera completely here, otherwise remote peers might break. 
+      // But if user requested resource cleanup, we drop the hardware link cleanly. 
+      if (cameraEnabled && rawCameraTrackRef.current) {
+        rawCameraTrackRef.current.stop();
+        rawCameraTrackRef.current = null;
+      }
+
+      setIsScreenSharing(true);
+
+      const activeAudio = localStream ? localStream.getAudioTracks() : [];
+      const newLocal = new MediaStream([screenTrack, ...activeAudio]);
+      setLocalStream(newLocal);
+
+      // Instantly swap view to display
+      await replaceTrackOnPeers('video', screenTrack, newLocal);
+
+      console.log('[RTC] Screen share successfully mapped and routed');
+    } catch (err) {
+      console.warn('[RTC] Screen share failed or cancelled:', err);
+    }
+  }, [isScreenSharing, cameraEnabled, localStream, stopScreenShare, replaceTrackOnPeers]);
+
   const closeAll = useCallback(() => {
-    for (const [peerId, pc] of pcsRef.current.entries()) {
-      try {
-        pc.close();
-      } catch (err) {
-        console.warn(`[RTC] Error closing PC for ${peerId}:`, err);
-      }
-    }
+    pcsRef.current.forEach(pc => pc.close());
     pcsRef.current.clear();
-    sendersRef.current.clear();
-    console.log('[RTC] Closed all PeerConnections');
-  }, []);
+    
+    if (localStream) localStream.getTracks().forEach(t => t.stop());
+    if (rawCameraTrackRef.current) rawCameraTrackRef.current.stop();
+    if (screenTrackRef.current) screenTrackRef.current.stop();
+  }, [localStream]);
 
   return {
     createPeerConnection,
-    addLocalTracks,
-    replaceTrack,
-    getAllPeerConnections,
-    closePeerConnection,
+    handleSignal,
+    initCamera,
+    startScreenShare,
+    stopScreenShare,
+    replaceTrack: replaceTrackOnPeers,
     closeAll,
-    pcsRef, // Direct access to refs for advanced cases
-    sendersRef,
+    
+    localStream,
+    isScreenSharing,
+    cameraEnabled,
+    pcsRef
   };
 }

@@ -322,11 +322,15 @@ export default function Room() {
           
           // Accumulate tracks gracefully to accommodate standalone split stream topologies natively
           setStreams((prev) => {
-            const existingStream = prev[peerId] || new MediaStream();
-            if (!existingStream.getTracks().includes(track)) {
-              existingStream.addTrack(track);
+            const newStream = new MediaStream();
+            const existingStream = prev[peerId];
+            if (existingStream) {
+              existingStream.getTracks().forEach(t => newStream.addTrack(t));
             }
-            remoteStreamsRef.current.set(peerId, existingStream);
+            if (!newStream.getTracks().includes(track)) {
+              newStream.addTrack(track);
+            }
+            remoteStreamsRef.current.set(peerId, newStream);
             
             // Setup speaker analyzer explicitly if an audio track arrives
             if (track.kind === 'audio' && !speakerAnalyzersRef.current.has(peerId)) {
@@ -339,7 +343,7 @@ export default function Room() {
               speakerAnalyzersRef.current.set(peerId, { ctx, analyser, data: dataArr });
             }
 
-            return { ...prev, [peerId]: existingStream };
+            return { ...prev, [peerId]: newStream };
           });
         },
       });
@@ -533,21 +537,30 @@ export default function Room() {
 
   const addOrReplaceTrack = useCallback(async (peerId, track, stream) => {
     const pc = pcsRef.current.get(peerId);
-    if (!pc) return { renegotiationNeeded: false };
+    if (!pc) return;
 
-    // Standard fallback: match any transceiver that is structurally bound to this media kind
-    const transceiver = pc.getTransceivers().find(t => 
-      t.receiver.track?.kind === track.kind || t.sender.track?.kind === track.kind
+    // Find the transceiver corresponding to this track's kind
+    // transceiver.receiver.track ALWAYS exists for a transceiver, so we can use its kind.
+    // Also ensuring the transceiver is not stopped.
+    let transceiver = pc.getTransceivers().find(t => 
+      !t.stopped && (t.receiver?.track?.kind === (track ? track.kind : 'video') || t.sender?.track?.kind === (track ? track.kind : 'video'))
     );
     
     if (transceiver && transceiver.sender) {
       await transceiver.sender.replaceTrack(track);
-      console.log(`[RTC] Replaced ${track.kind} track for peer ${peerId}`);
-      return { renegotiationNeeded: false };
-    } else {
+      
+      if (track) {
+        if (transceiver.direction === 'recvonly') transceiver.direction = 'sendrecv';
+        else if (transceiver.direction === 'inactive') transceiver.direction = 'sendonly';
+      } else {
+        if (transceiver.direction === 'sendrecv') transceiver.direction = 'recvonly';
+        else if (transceiver.direction === 'sendonly') transceiver.direction = 'inactive';
+      }
+
+      console.log(`[RTC] Replaced track for peer ${peerId}`);
+    } else if (track) {
       pc.addTrack(track, stream);
       console.log(`[RTC] Added ${track.kind} track to PC for peer ${peerId}`);
-      return { renegotiationNeeded: true };
     }
   }, []);
 
@@ -572,10 +585,7 @@ export default function Room() {
         }
 
         for (const peerId of pcsRef.current.keys()) {
-          const res = await addOrReplaceTrack(peerId, track, activeStream);
-          if (res?.renegotiationNeeded) {
-            renegotiate(peerId);
-          }
+          await addOrReplaceTrack(peerId, track, activeStream);
         }
 
         if (aiOn) {
@@ -625,6 +635,11 @@ export default function Room() {
   }, [micEnabled, localStream, aiOn, addOrReplaceTrack, renegotiate, showToast]);
 
   const toggleCamera = useCallback(async () => {
+    if (isScreenSharing) {
+      showToast('Cannot toggle camera while sharing screen', 'error');
+      return;
+    }
+
     if (!cameraEnabled) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ video: true });
@@ -662,27 +677,14 @@ export default function Room() {
         }
 
         // MANDATORY FIX: explicitly map to Send-Receive directly without wrappers
-        pcsRef.current.forEach((pc, peerId) => {
-          const sender = pc.getSenders().find(s => s.track?.kind === "video");
-
-          if (sender) {
-            console.log("Sender replaced:", sender);
-            sender.replaceTrack(processedTrack);
-          } else {
-            console.log("Sending processed track:", processedTrack);
-            // Must use processedStream as explicitly mandated
-            pc.addTrack(processedTrack, processedStream);
-            
-            // Ensure audio is preserved natively alongside it inside localStream context explicitly
-            const audioTrack = activeStream.getAudioTracks()[0];
-            if (audioTrack) {
-              const audioSender = pc.getSenders().find(s => s.track?.kind === "audio");
-              if (!audioSender) {
-                pc.addTrack(audioTrack, activeStream);
-              }
-            }
+        pcsRef.current.forEach(async (pc, peerId) => {
+          await addOrReplaceTrack(peerId, processedTrack, processedStream);
+          
+          // Ensure audio is preserved natively alongside it inside localStream context explicitly
+          const audioTrack = activeStream.getAudioTracks()[0];
+          if (audioTrack) {
+            await addOrReplaceTrack(peerId, audioTrack, activeStream);
           }
-          renegotiate(peerId);
         });
 
         setCameraEnabled(true);
@@ -747,17 +749,31 @@ export default function Room() {
       const screenTrack = display.getVideoTracks()[0];
       if (!screenTrack) return;
 
+      // Temporary shutdown of camera to save hardware resources while screen sharing
+      if (cameraEnabled && rawVideoTrackRef.current) {
+        rawVideoTrackRef.current.stop();
+        rawVideoTrackRef.current = null;
+        videoProcRef.current?.stopRenderLoop?.();
+      }
+
       setIsScreenSharing(true);
       screenTrack.onended = stopScreenShare;
       setScreenStream(display);
 
+      // local preview update: map screen content natively so PiP displays it locally
+      const activeAudio = localStream ? localStream.getAudioTracks() : [];
+      const newLocal = new MediaStream([screenTrack, ...activeAudio]);
+      setLocalStream(newLocal);
+
       // Replace video track on all peers
       for (const peerId of pcsRef.current.keys()) {
         if (screenTrack) {
-          await addOrReplaceTrack(peerId, screenTrack, display);
-          renegotiate(peerId);
+          await addOrReplaceTrack(peerId, screenTrack, newLocal);
         }
       }
+
+      // Broadcast media state so remote peers render the video stream natively
+      roomSocketRef.current?.send('media_state', { state: { video: true } });
 
       showToast('Screen sharing started', 'success');
     } catch (err) {
@@ -766,29 +782,85 @@ export default function Room() {
         showToast('Failed to start screen share', 'error');
       }
     }
-  }, [isScreenSharing, showToast]);
+  }, [isScreenSharing, showToast, addOrReplaceTrack, renegotiate, cameraEnabled, localStream]);
 
   const stopScreenShare = useCallback(async () => {
     if (!isScreenSharing) return;
 
+    if (screenStream) {
+      screenStream.getVideoTracks().forEach(t => t.onended = null);
+    }
+
     try {
-      const cameraVideoTrack = localStream?.getVideoTracks()[0];
-      if (cameraVideoTrack) {
-        // Restore camera
+      if (cameraEnabled) {
+        showToast('Restoring camera...', 'info');
+        // Automatically restore camera using fresh getUserMedia request
+        const freshCameraStream = await navigator.mediaDevices.getUserMedia({ video: true });
+        const rawTrack = freshCameraStream.getVideoTracks()[0];
+        
+        if (rawVideoTrackRef.current) rawVideoTrackRef.current.stop();
+        rawVideoTrackRef.current = rawTrack;
+
+        rawVideoRef.current.srcObject = new MediaStream([rawTrack]);
+        await rawVideoRef.current.play().catch(() => {});
+        videoProcRef.current?.startRenderLoop?.(rawVideoRef.current, processedCanvasRef.current);
+        
+        const processedStream = processedCanvasRef.current.captureStream(30);
+        const proxyTrack = processedStream.getVideoTracks()[0];
+
+        // Ensure we combine any remaining local audio tracks nicely
+        const audioTracks = localStream ? localStream.getAudioTracks() : [];
+        const finalStream = new MediaStream([...audioTracks, proxyTrack]);
+        setLocalStream(finalStream);
+
+        // Restore camera dynamically on peers safely handling constraints
         for (const peerId of pcsRef.current.keys()) {
-          await addOrReplaceTrack(peerId, cameraVideoTrack, localStream);
+          await addOrReplaceTrack(peerId, proxyTrack, finalStream);
+        }
+        roomSocketRef.current?.send('media_state', { state: { video: true } });
+        showToast('Screen sharing stopped. Camera restored', 'success');
+      } else {
+        // Mute video safely
+        for (const peerId of pcsRef.current.keys()) {
+          const pc = pcsRef.current.get(peerId);
+          if (pc) {
+            const transceiver = pc.getTransceivers().find(t => 
+              t.receiver.track?.kind === 'video' || t.sender.track?.kind === 'video'
+            );
+            if (transceiver && transceiver.sender) {
+              transceiver.sender.replaceTrack(null).catch(e => console.warn('replaceTrack(null) failed', e));
+              if (transceiver.direction === 'sendrecv') transceiver.direction = 'recvonly';
+              else if (transceiver.direction === 'sendonly') transceiver.direction = 'inactive';
+            }
+          }
           renegotiate(peerId);
         }
+        roomSocketRef.current?.send('media_state', { state: { video: false } });
+        
+        const audioTracks = localStream ? localStream.getAudioTracks() : [];
+        if (audioTracks.length > 0) {
+          setLocalStream(new MediaStream(audioTracks));
+        } else {
+          setLocalStream(null);
+        }
+        showToast('Screen sharing stopped', 'info');
       }
 
       screenStream?.getTracks?.().forEach((t) => t.stop());
       setScreenStream(null);
       setIsScreenSharing(false);
-      showToast('Screen sharing stopped', 'success');
+      
     } catch (err) {
-      console.warn('[RTC] Error stopping screen share:', err);
+      console.warn('[RTC] Error stopping screen share or restoring camera:', err);
+      // Clean up fallback states safely
+      setCameraEnabled(false);
+      setIsScreenSharing(false);
+      setScreenStream(null);
+      roomSocketRef.current?.send('media_state', { state: { video: false } });
+      const audioTracks = localStream ? localStream.getAudioTracks() : [];
+      setLocalStream(audioTracks.length > 0 ? new MediaStream(audioTracks) : null);
     }
-  }, [isScreenSharing, localStream, screenStream, showToast]);
+  }, [isScreenSharing, localStream, screenStream, showToast, cameraEnabled, addOrReplaceTrack, renegotiate]);
 
   // ============================================================================
   // CLEANUP & LEAVING
