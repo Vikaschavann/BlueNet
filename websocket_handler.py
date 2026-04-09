@@ -49,6 +49,8 @@ class WebSocketHandler:
                             "max_score": result.get("max_score", 0)
                         }
                         
+                        print("Prediction:", response)
+                        
                         await websocket.send_json(response)
                     except Exception as e:
                         logging.error(f"Error moderating video frame: {e}")

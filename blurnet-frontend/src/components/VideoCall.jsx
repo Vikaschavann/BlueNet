@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { WebSocketClient } from '../utils/WebSocketClient';
 import { VideoProcessor } from '../utils/VideoProcessor';
 import { AudioProcessor } from '../utils/AudioProcessor';
@@ -138,6 +138,19 @@ const VideoCall = () => {
     }
   };
 
+  const handleMessage = (data) => {
+    if (data.type === 'moderation_result') {
+      if (videoProcRef.current) {
+        // Feed the response back to the processor to trigger blur!
+        videoProcRef.current.setRegions(data.regions, data.max_score);
+      }
+    } else if (data.type === 'audio_result') {
+      // (Optional) Handle audio chunks tracking later
+    } else if (data.error) {
+      console.error('Moderation WS Error:', data.error);
+    }
+  };
+
   const startCall = async () => {
     if (isModerationActive || loading) return;
 
@@ -162,6 +175,11 @@ const VideoCall = () => {
         if (!ws.isConnected || !isActiveRef.current) return;
         const frame = videoProcRef.current.extractFrame(localVideoRef.current);
         if (frame) ws.send('video_frame', frame);
+        
+        // LOOP: Repeat every 200ms (5 FPS target)
+        if (isActiveRef.current) {
+          setTimeout(sendNextFrame, 200);
+        }
       };
       sendFrameTriggerRef.current = sendNextFrame;
       setTimeout(sendNextFrame, 500);

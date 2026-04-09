@@ -31,6 +31,11 @@ export class VideoProcessor {
         this.smoothedRegions = [];
         this.smoothingFactor = 0.5; // Optimized for 30fps
 
+        // Hysteresis & Smoothing Configuration
+        this.scoreHistory = [];
+        this.isGloballyBlurred = false;
+        this.lastUnsafeTime = 0;
+
         this.video = null;
         this.canvas = null;
         this.animationId = null;
@@ -38,14 +43,48 @@ export class VideoProcessor {
 
     // This is called by VideoCall when WebSocket receives message
     setRegions(regions, maxScore = 0) {
-        this.blurRegions = regions || [];
+        // 1. Queue History (last 5 frames)
+        this.scoreHistory.push(maxScore);
+        if (this.scoreHistory.length > 5) this.scoreHistory.shift();
 
-        // TARGETED TRIGGER: Prevent 5-second full screen blindness on minor detections.
-        // We rely on the surgical WebGL blur for most things, but trigger a short 
-        // 800ms full-screen lockdown only if the AI is extremely confident (> 85%)
-        if (this.blurRegions.length > 0 && maxScore > 0.85) {
-            this.lockdownUntil = Date.now() + 800;
-            this.shieldLife = 5;
+        const unsafeCount = this.scoreHistory.filter(s => s >= 0.5).length;
+        const safeCount = this.scoreHistory.filter(s => s < 0.5).length;
+
+        // 2. Hysteresis Logic
+        if (!this.isGloballyBlurred) {
+            // Blur ON threshold: confidence > 0.8 OR majority unsafe
+            if (maxScore > 0.8 || unsafeCount >= 3) {
+                this.isGloballyBlurred = true;
+                this.lastUnsafeTime = Date.now();
+            }
+        } else {
+            // Blur OFF threshold: confidence < 0.5 AND majority safe
+            if (maxScore < 0.5 && safeCount >= 3) {
+                // Time-based reset: No unsafe detection for 1.5 seconds
+                if (Date.now() - this.lastUnsafeTime > 1500) {
+                    this.isGloballyBlurred = false;
+                }
+            } else if (maxScore >= 0.5) {
+                this.lastUnsafeTime = Date.now();
+            }
+        }
+
+        // 3. Explicit State Setup vs Reset
+        if (this.isGloballyBlurred) {
+            this.blurRegions = regions || [];
+            
+            // Hard Lockdown if extremely high
+            if (maxScore > 0.85) {
+                this.lockdownUntil = Date.now() + 800;
+                this.shieldLife = 5;
+            }
+        } else {
+            // EXPLICIT STATE RESET WHEN SAFE (Avoids getting stuck)
+            this.blurRegions = [];
+            this.persistenceBuffer = [];
+            this.smoothedRegions = [];
+            this.lockdownUntil = 0;
+            this.shieldLife = 0;
         }
     }
 
@@ -161,6 +200,11 @@ export class VideoProcessor {
                 ctx.strokeRect(x, y, w, h);
 
                 region.life -= 1;
+            });
+
+            // FIX CANVAS PROCESSING LOOP: Decay the persistence buffer too!
+            this.persistenceBuffer.forEach(region => {
+                region.life -= 1; 
             });
 
             this.smoothedRegions = this.smoothedRegions.filter(r => r.life > 0);

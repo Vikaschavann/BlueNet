@@ -108,7 +108,7 @@ export default function Room() {
 
   const [aiOn, setAiOn] = useState(true);
   const [audioSanitized, setAudioSanitized] = useState(false);
-  
+
   // Initialize AI Video Pipeline globally off-screen
   useEffect(() => {
     videoProcRef.current = new VideoProcessor({ width: 640, height: 480 });
@@ -141,6 +141,17 @@ export default function Room() {
   // Track what the user has enabled (independent of actual stream)
   const [micEnabled, setMicEnabled] = useState(false);
   const [cameraEnabled, setCameraEnabled] = useState(false);
+
+  // ============================================================================
+  // SYNCHRONIZED REFS (Must be declared AFTER their corresponding useState)
+  // ============================================================================
+  const aiOnRef = useRef(aiOn);
+  const localStreamRef = useRef(localStream);
+  const micEnabledRef = useRef(micEnabled);
+
+  useEffect(() => { aiOnRef.current = aiOn; }, [aiOn]);
+  useEffect(() => { localStreamRef.current = localStream; }, [localStream]);
+  useEffect(() => { micEnabledRef.current = micEnabled; }, [micEnabled]);
 
   // ============================================================================
   // EFFECTS: ROOM INITIALIZATION
@@ -188,23 +199,26 @@ export default function Room() {
       if (msg?.type === 'audio_result' && msg?.result?.abusive) {
         setAudioSanitized(true);
         // Temporarily mute mic
-        if (localStream) {
-          localStream.getAudioTracks().forEach((t) => (t.enabled = false));
+        if (localStreamRef.current) {
+          localStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = false));
         }
         setTimeout(() => {
           setAudioSanitized(false);
-          if (localStream && micEnabled) {
-            localStream.getAudioTracks().forEach((t) => (t.enabled = true));
+          if (localStreamRef.current && micEnabledRef.current) {
+            localStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = true));
           }
         }, 2500);
       }
       if (msg?.type === 'moderation_result') {
+        console.log("AI response:", msg);
         videoProcRef.current?.setRegions?.(msg.regions || [], msg.max_score || 0);
       }
     });
+
+    ws.connect().catch(e => console.error("WS Connect err", e));
     moderationWsRef.current = ws;
     return () => ws.disconnect();
-  }, [MODERATION_WS, micEnabled, localStream]);
+  }, [MODERATION_WS]);
 
   // Active speaker detection
   useEffect(() => {
@@ -576,8 +590,10 @@ export default function Room() {
         let outboundStream = stream;
         console.log("Microphone track started");
 
-        if (aiOn) {
-          await moderationWsRef.current?.connect?.();
+        if (aiOnRef.current) {
+          if (!moderationWsRef.current?.isConnected) {
+             await moderationWsRef.current?.connect?.();
+          }
           audioProcRef.current = new AudioProcessor((chunk) => {
             moderationWsRef.current?.send?.('audio_chunk', chunk);
           });
@@ -657,13 +673,20 @@ export default function Room() {
         const processedTrack = processedStream.getVideoTracks()[0];
 
         // Start async interception sending loop safely
+        if (aiOnRef.current && moderationWsRef.current && !moderationWsRef.current.isConnected) {
+          await moderationWsRef.current.connect();
+        }
+
         if (!sendLoopRef.current) {
           sendLoopRef.current = setInterval(() => {
-            if (moderationWsRef.current?.isConnected) {
+            if (aiOnRef.current && moderationWsRef.current?.isConnected) {
               const frame = videoProcRef.current?.extractFrame?.(rawVideoRef.current);
-              if (frame) moderationWsRef.current.send('video_frame', frame);
+              if (frame) {
+                console.log("Frame sent");
+                moderationWsRef.current.send('video_frame', frame);
+              }
             }
-          }, 600);
+          }, 250); // High frequency (~4 FPS) for 200-500ms latency
         }
 
         let activeStream = localStream;
