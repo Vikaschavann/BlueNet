@@ -1,16 +1,22 @@
 export class AudioProcessor {
     constructor(onChunk) {
         this.onChunk = onChunk;
+        
+        // Web Audio API Elements
+        this.audioContext = null;
+        this.sourceNode = null;
+        this.gainNode = null;
+        this.destinationNode = null;
+        
         this.originalStream = null;
-        this.audioOnlyStream = null;
         this.isMuted = false;
-        this.chunkDuration = 2000; // 2 seconds
+        
         this.mediaRecorder = null;
+        this.chunkDuration = 2000;
         this.supportedMimeType = null;
     }
 
     getSupportedMimeType() {
-        // Prioritized list as requested
         const types = [
             'audio/webm;codecs=opus',
             'audio/webm',
@@ -21,44 +27,49 @@ export class AudioProcessor {
         ];
         for (const type of types) {
             if (MediaRecorder.isTypeSupported(type)) {
-                console.log(`[AUDIO] Detected supported MIME type: ${type}`);
                 return type;
             }
         }
-        return ''; // Final fallback
+        return '';
     }
 
     async start(stream) {
         try {
-            console.log('[AUDIO] Attempting to start MediaRecorder...');
+            console.log('[AUDIO] Initializing AudioContext moderation proxy...');
             this.originalStream = stream;
 
-            // 1. Extract only audio tracks and create a new MediaStream
             const audioTracks = stream.getAudioTracks();
             if (audioTracks.length === 0) {
-                throw new Error('No audio tracks found in the provided stream.');
+                throw new Error('No audio tracks found relative to raw stream.');
             }
 
-            // Ensure the track is active/live
-            const audioTrack = audioTracks[0];
-            if (audioTrack.readyState !== 'live' || !audioTrack.enabled) {
-                throw new Error(`Audio track is not ready for recording (State: ${audioTrack.readyState}, Enabled: ${audioTrack.enabled})`);
+            // 1. Initialize Web Audio API (Must be done safely after user gesture)
+            this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            
+            // 2. Map Original Stream -> GainNode -> Destination (for WebRTC outbound)
+            this.sourceNode = this.audioContext.createMediaStreamSource(this.originalStream);
+            this.gainNode = this.audioContext.createGain();
+            this.destinationNode = this.audioContext.createMediaStreamDestination();
+            
+            // Wire the safe outbound pipeline
+            this.sourceNode.connect(this.gainNode);
+            this.gainNode.connect(this.destinationNode);
+            
+            // Make sure the audio context natively resumes
+            if (this.audioContext.state === 'suspended') {
+                await this.audioContext.resume();
             }
 
-            this.audioOnlyStream = new MediaStream([audioTrack]);
-            console.log('[AUDIO] Created audio-only MediaStream for recording');
-
-            // 2. Detect the best supported MIME type
+            // 3. Script processor loop to still feed WebSockets via chunk collector
             this.supportedMimeType = this.getSupportedMimeType();
             const options = this.supportedMimeType ? { mimeType: this.supportedMimeType } : {};
-
-            // 3. Initialize MediaRecorder with audio-only stream
-            this.mediaRecorder = new MediaRecorder(this.audioOnlyStream, options);
+            
+            // We use the raw stream to feed AI, so it can monitor toxicity even while the peer is muted outgoing
+            this.mediaRecorder = new MediaRecorder(this.originalStream, options);
 
             this.mediaRecorder.ondataavailable = async (event) => {
                 if (event.data.size > 0 && this.onChunk) {
                     try {
-                        // Use the detected MIME type or the blob's native type
                         const blobType = this.supportedMimeType || event.data.type;
                         const blob = new Blob([event.data], { type: blobType });
                         const base64 = await this.blobToBase64(blob);
@@ -68,51 +79,47 @@ export class AudioProcessor {
                     }
                 }
             };
-
-            this.mediaRecorder.onerror = (event) => {
-                console.error('[AUDIO] MediaRecorder runtime error:', event.error);
-            };
-
-            this.mediaRecorder.onstop = () => {
-                console.log('[AUDIO] MediaRecorder successfully stopped');
-            };
-
-            // 4. Start recording with 2-second time slices
             this.mediaRecorder.start(this.chunkDuration);
-            console.log(`[AUDIO] MediaRecorder started (${this.supportedMimeType || 'default'}) at ${this.chunkDuration}ms intervals`);
 
+            console.log('[AUDIO] Audio Moderation Pipeline wired successfully.');
         } catch (error) {
-            console.error('[AUDIO] CRITICAL: Failed to execute start on MediaRecorder:', error.message);
+            console.error('[AUDIO] CRITICAL Error initializing WebAudio:', error);
             throw error;
         }
     }
 
+    /**
+     * EXTRACT PROXY STREAM
+     * returns a cloned safe AudioTrack driven entirely by the GainNode
+     */
+    getProcessedStream() {
+        if (!this.destinationNode) {
+            console.warn('[AUDIO] Called getProcessedStream before constraints were built.');
+            return null;
+        }
+        return this.destinationNode.stream;
+    }
+
     stop() {
         if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
-            try {
-                this.mediaRecorder.stop();
-            } catch (err) {
-                console.error('[AUDIO] Error during stop:', err);
-            }
+            this.mediaRecorder.stop();
         }
-        // Cleanup streams
-        if (this.audioOnlyStream) {
-            this.audioOnlyStream.getTracks().forEach(track => track.stop());
+        
+        if (this.audioContext && this.audioContext.state !== 'closed') {
+            this.audioContext.close();
         }
+        
+        this.originalStream = null;
     }
 
     setMute(muted) {
         this.isMuted = muted;
-        // Mute both original and recording streams
-        const streams = [this.originalStream, this.audioOnlyStream];
-        streams.forEach(s => {
-            if (s) {
-                s.getAudioTracks().forEach(track => {
-                    track.enabled = !muted;
-                });
-            }
-        });
-        console.log(`[AUDIO] Mute status set to: ${muted}`);
+        if (this.gainNode) {
+            // Drop Outbound Gain completely so Remote sees audio-silence
+            // but the AI WebSocket continues to ingest audio via MediaRecorder!
+            this.gainNode.gain.setTargetAtTime(muted ? 0 : 1, this.audioContext.currentTime, 0.05);
+        }
+        console.log(`[AUDIO] Outbound Toxicity Muted via GainNode: ${muted}`);
     }
 
     blobToBase64(blob) {
@@ -120,11 +127,8 @@ export class AudioProcessor {
             const reader = new FileReader();
             reader.onloadend = () => {
                 if (reader.result) {
-                    const base64 = reader.result.split(',')[1];
-                    resolve(base64);
-                } else {
-                    reject(new Error('FileReader result was null'));
-                }
+                    resolve(reader.result.split(',')[1]);
+                } else reject(new Error('FileReader result null'));
             };
             reader.onerror = () => reject(reader.error);
             reader.readAsDataURL(blob);
