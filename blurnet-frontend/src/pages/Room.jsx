@@ -123,7 +123,7 @@ export default function Room() {
 
     return () => {
       videoProcRef.current?.stopRenderLoop?.();
-      clearInterval(sendLoopRef.current);
+      clearTimeout(sendLoopRef.current);
     };
   }, []);
 
@@ -210,8 +210,13 @@ export default function Room() {
         }, 2500);
       }
       if (msg?.type === 'moderation_result') {
-        console.log("AI response:", msg);
-        videoProcRef.current?.setRegions?.(msg.regions || [], msg.max_score || 0);
+        const proc = videoProcRef.current;
+        if (proc) {
+            proc.notifyFrameReceived();
+            const latency = Date.now() - proc.lastFrameSentAt;
+            // console.log(`Backend response: ${latency}ms | Score: ${msg.max_score.toFixed(2)}`);
+            proc.setRegions(msg.regions || [], msg.max_score || 0, msg.nsfw_score || 0.0);
+        }
       }
     });
 
@@ -678,15 +683,26 @@ export default function Room() {
         }
 
         if (!sendLoopRef.current) {
-          sendLoopRef.current = setInterval(() => {
-            if (aiOnRef.current && moderationWsRef.current?.isConnected) {
-              const frame = videoProcRef.current?.extractFrame?.(rawVideoRef.current);
+          console.log("Processing stream type: webcam");
+          const loop = () => {
+            const proc = videoProcRef.current;
+            if (!proc) return;
+            const now = Date.now();
+            if (proc.isBackendProcessing) {
+              if (now - proc.lastFrameSentAt > 500) {
+                 console.log("Failsafe: Backend lagging >500ms");
+                 proc.triggerFailsafeBlur();
+              }
+            } else if (aiOnRef.current && moderationWsRef.current?.isConnected) {
+              const frame = proc.extractFrame(rawVideoRef.current, 'webcam');
               if (frame) {
-                console.log("Frame sent");
-                moderationWsRef.current.send('video_frame', frame);
+                proc.notifyFrameSent();
+                moderationWsRef.current.send('video_frame', { frame, source_type: 'webcam' });
               }
             }
-          }, 250); // High frequency (~4 FPS) for 200-500ms latency
+            sendLoopRef.current = setTimeout(loop, 100);
+          };
+          loop();
         }
 
         let activeStream = localStream;
@@ -719,7 +735,7 @@ export default function Room() {
     } else {
       // Cleanly stop proxy interception loops
       if (sendLoopRef.current) {
-        clearInterval(sendLoopRef.current);
+        clearTimeout(sendLoopRef.current);
         sendLoopRef.current = null;
       }
       videoProcRef.current?.stopRenderLoop?.();
@@ -783,6 +799,33 @@ export default function Room() {
         
         const processedStream = processedCanvasRef.current.captureStream(30);
         const proxyTrack = processedStream.getVideoTracks()[0];
+
+        // Ensure we explicitly resume the WEBCAM moderation loop
+        if (aiOnRef.current && moderationWsRef.current && !moderationWsRef.current.isConnected) {
+          await moderationWsRef.current.connect();
+        }
+        if (sendLoopRef.current) clearTimeout(sendLoopRef.current);
+        
+        console.log("Processing stream type: webcam");
+        const loop = () => {
+          const proc = videoProcRef.current;
+          if (!proc) return;
+          const now = Date.now();
+          if (proc.isBackendProcessing) {
+            if (now - proc.lastFrameSentAt > 500) {
+               console.log("Failsafe: Backend lagging >500ms");
+               proc.triggerFailsafeBlur();
+            }
+          } else if (aiOnRef.current && moderationWsRef.current?.isConnected) {
+            const frame = proc.extractFrame(rawVideoRef.current, 'webcam');
+            if (frame) {
+              proc.notifyFrameSent();
+              moderationWsRef.current.send('video_frame', { frame, source_type: 'webcam' });
+            }
+          }
+          sendLoopRef.current = setTimeout(loop, 100);
+        };
+        loop();
 
         // 3. Construct proxy securely
         const audioTracks = localStream ? localStream.getAudioTracks() : [];
@@ -857,6 +900,33 @@ export default function Room() {
       videoProcRef.current?.startRenderLoop?.(rawVideoRef.current, processedCanvasRef.current);
       const processedStream = processedCanvasRef.current.captureStream(30);
       const proxyTrack = processedStream.getVideoTracks()[0];
+
+      // 3. START AI ON SCREEN CONTENT EXPLICITLY
+      if (aiOnRef.current && moderationWsRef.current && !moderationWsRef.current.isConnected) {
+        await moderationWsRef.current.connect();
+      }
+      if (sendLoopRef.current) clearTimeout(sendLoopRef.current);
+      
+      console.log("Processing stream type: screen");
+      const loop = () => {
+        const proc = videoProcRef.current;
+        if (!proc) return;
+        const now = Date.now();
+        if (proc.isBackendProcessing) {
+          if (now - proc.lastFrameSentAt > 500) {
+             console.log("Failsafe: Backend lagging >500ms");
+             proc.triggerFailsafeBlur();
+          }
+        } else if (aiOnRef.current && moderationWsRef.current?.isConnected) {
+          const frame = proc.extractFrame(rawVideoRef.current, 'screen');
+          if (frame) {
+            proc.notifyFrameSent();
+            moderationWsRef.current.send('video_frame', { frame, source_type: 'screen' });
+          }
+        }
+        sendLoopRef.current = setTimeout(loop, 100);
+      };
+      loop();
 
       setIsScreenSharing(true);
       screenTrack.onended = () => stopScreenShare(); // Must wrap correctly to decouple event

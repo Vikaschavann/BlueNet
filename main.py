@@ -6,6 +6,7 @@ import auth_router
 from models.nudity_model import NudityModel
 from models.speech_model import SpeechModel
 from models.abuse_model import AbuseModel
+from models.nsfw_model import NSFWModel
 from video_moderator import VideoModerator
 from audio_moderator import AudioModerator
 from websocket_handler import WebSocketHandler
@@ -18,9 +19,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 nudity_model = NudityModel()
 speech_model = SpeechModel()
 abuse_model = AbuseModel()
+nsfw_model = NSFWModel()
 
 # Global moderators
-video_moderator = VideoModerator(nudity_model)
+video_moderator = VideoModerator(nudity_model, nsfw_model)
 audio_moderator = AudioModerator(speech_model, abuse_model)
 ws_handler = WebSocketHandler(video_moderator, audio_moderator)
 meeting_server = MeetingSignalingServer()
@@ -32,6 +34,7 @@ async def lifespan(app: FastAPI):
     nudity_model.load()
     speech_model.load()
     abuse_model.load()
+    nsfw_model.load()
     yield
     # Clean up on shutdown if needed
     logging.info("Shutting down...")

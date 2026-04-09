@@ -38,14 +38,23 @@ class WebSocketHandler:
                         
                     is_processing_video = True
                     try:
-                        # Optimization: Offload to ThreadPoolExecutor for real parallel processing
-                        result = await loop.run_in_executor(self.executor, self.video_mod.moderate_frame, payload)
+                        source = "webcam"
+                        frame_data = payload
+                        if isinstance(payload, dict):
+                            frame_data = payload.get("frame")
+                            source = payload.get("source_type", "webcam")
+                            
+                        print(f"Frame received from: {source}")
                         
-                        # STEP 4: Send regions via websocket with type: moderation_result
+                        # Optimization: Offload to ThreadPoolExecutor for real parallel processing
+                        result = await loop.run_in_executor(self.executor, self.video_mod.moderate_frame, frame_data)
+                        
+                        # STEP 4: Send unified pipeline results via websocket
                         response = {
                             "type": "moderation_result",
                             "regions": result["regions"],
                             "unsafe": result["unsafe"],
+                            "nsfw_score": result.get("nsfw_score", 0.0),
                             "max_score": result.get("max_score", 0)
                         }
                         

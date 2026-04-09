@@ -3,10 +3,13 @@ import base64
 import numpy as np
 import os
 from models.nudity_model import NudityModel
+from models.nsfw_model import NSFWModel
+from PIL import Image
 
 class VideoModerator:
-    def __init__(self, nudity_model: NudityModel):
+    def __init__(self, nudity_model: NudityModel, nsfw_model: NSFWModel = None):
         self.nudity_model = nudity_model
+        self.nsfw_model = nsfw_model
 
     def moderate_frame(self, base64_frame):
         """
@@ -37,8 +40,17 @@ class VideoModerator:
         # This converts ~150ms latency per frame to ~2ms per frame on CPU.
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # STEP 2: Multi-Label Inference
+        # STEP 2a: Multi-Label Inference (Detections)
         detections = self.nudity_model.detect(frame_rgb)
+        
+        # STEP 2b: Global Frame Inference (NSFW Classification)
+        nsfw_score = 0.0
+        if self.nsfw_model:
+            try:
+                pil_img = Image.fromarray(frame_rgb)
+                nsfw_score = self.nsfw_model.predict(pil_img)
+            except Exception as e:
+                print(f"[NSFW Model Error] {e}")
         
         target_labels = {
             'EXPOSED_BREAST_F', 'EXPOSED_GENITALIA_F', 'EXPOSED_GENITALIA_M', 
@@ -107,11 +119,19 @@ class VideoModerator:
                         # print(f"[SENTINEL] Interaction detected (dist={dist:.1f}px). Safety Override engaged.")
                         break
 
+        # Override Unified Safety Flag
+        if nsfw_score > 0.7 or len(regions) > 0:
+            is_unsafe = True
+
+        print(f"NSFW Score: {nsfw_score:.4f}")
+        print(f"Regions detected: {len(regions)}")
+
         if len(regions) > 0:
             print(f"[SENTINEL] Unsafe: {is_unsafe}, MaxScore: {max_score:.2f}, Regions: {len(regions)}")
 
         return {
             "unsafe": is_unsafe,
             "regions": regions,
+            "nsfw_score": nsfw_score,
             "max_score": max_score 
         }

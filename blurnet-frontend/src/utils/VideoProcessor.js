@@ -36,64 +36,103 @@ export class VideoProcessor {
         this.isGloballyBlurred = false;
         this.lastUnsafeTime = 0;
 
+        // Backpressure and Failsafe Flags
+        this.isBackendProcessing = false;
+        this.lastFrameSentAt = 0;
+
         this.video = null;
         this.canvas = null;
         this.animationId = null;
     }
 
+    notifyFrameSent() {
+        this.isBackendProcessing = true;
+        this.lastFrameSentAt = Date.now();
+    }
+
+    notifyFrameReceived() {
+        this.isBackendProcessing = false;
+    }
+
+    triggerFailsafeBlur() {
+        console.warn("[VideoProcessor] Triggering mandatory failsafe lockdown due to UI/latency threshold.");
+        this.shieldLife = 10;
+        this.lockdownUntil = Date.now() + 1000;
+        this.isGloballyBlurred = true;
+        this.isBackendProcessing = false; // Release the lock defensively
+        
+        // Ensure immediate draw if locked
+        this.blurRegions = [];
+        this.persistenceBuffer = [];
+        this.smoothedRegions = [];
+    }
+
     // This is called by VideoCall when WebSocket receives message
-    setRegions(regions, maxScore = 0) {
-        // 1. Queue History (last 5 frames)
-        this.scoreHistory.push(maxScore);
+    setRegions(regions, maxScore = 0, nsfwScore = 0.0) {
+        // console.log("Regions:", regions, "NSFW:", nsfwScore);
+        
+        // Ensure regions is an array
+        this.blurRegions = regions || [];
+
+        // IMPLEMENT NEW DECISION LOGIC:
+        // 1. IF nsfw_score > 0.8: Apply FULL FRAME BLUR
+        // 2. ELSE IF regions.length > 0: Apply REGION BLUR
+        // 3. ELSE IF nsfw_score > 0.7 AND regions.length == 0: Apply FULL FRAME BLUR
+        // 4. ELSE: No blur
+        
+        // Hysteresis & Smoothing Flags setup
+        this.scoreHistory.push(Math.max(maxScore, nsfwScore));
         if (this.scoreHistory.length > 5) this.scoreHistory.shift();
 
-        const unsafeCount = this.scoreHistory.filter(s => s >= 0.5).length;
         const safeCount = this.scoreHistory.filter(s => s < 0.5).length;
 
-        // 2. Hysteresis Logic
-        if (!this.isGloballyBlurred) {
-            // Blur ON threshold: confidence > 0.8 OR majority unsafe
-            if (maxScore > 0.8 || unsafeCount >= 3) {
-                this.isGloballyBlurred = true;
-                this.lastUnsafeTime = Date.now();
+        if (nsfwScore > 0.8 || (nsfwScore > 0.7 && this.blurRegions.length === 0)) {
+            this.isGloballyBlurred = true;
+            this.lastUnsafeTime = Date.now();
+            this.lockdownUntil = Date.now() + 800; // Force lockdown for high severity
+            this.shieldLife = 5;
+        } else if (this.blurRegions.length > 0) {
+            // Apply region blur normally (global blur is allowed to reset if we have bounded regions)
+            // Time-based reset logic for global blur when we successfully have pure regional targets
+            if (this.isGloballyBlurred && Date.now() - this.lastUnsafeTime > 1500 && safeCount >= 3) {
+                 this.isGloballyBlurred = false;
             }
         } else {
-            // Blur OFF threshold: confidence < 0.5 AND majority safe
-            if (maxScore < 0.5 && safeCount >= 3) {
-                // Time-based reset: No unsafe detection for 1.5 seconds
-                if (Date.now() - this.lastUnsafeTime > 1500) {
-                    this.isGloballyBlurred = false;
-                }
-            } else if (maxScore >= 0.5) {
-                this.lastUnsafeTime = Date.now();
+            // No blur needed, cleanly reset
+            if (Date.now() - this.lastUnsafeTime > 1500 && safeCount >= 3) {
+                this.isGloballyBlurred = false;
+                this.blurRegions = [];
+                this.persistenceBuffer = [];
+                this.smoothedRegions = [];
+                this.lockdownUntil = 0;
+                this.shieldLife = 0;
             }
-        }
-
-        // 3. Explicit State Setup vs Reset
-        if (this.isGloballyBlurred) {
-            this.blurRegions = regions || [];
-            
-            // Hard Lockdown if extremely high
-            if (maxScore > 0.85) {
-                this.lockdownUntil = Date.now() + 800;
-                this.shieldLife = 5;
-            }
-        } else {
-            // EXPLICIT STATE RESET WHEN SAFE (Avoids getting stuck)
-            this.blurRegions = [];
-            this.persistenceBuffer = [];
-            this.smoothedRegions = [];
-            this.lockdownUntil = 0;
-            this.shieldLife = 0;
         }
     }
 
-    // Helper to extract frame for backend
-    extractFrame(videoElement) {
+    // Helper to extract frame for backend with dynamic sizing
+    extractFrame(videoElement, sourceType = "webcam") {
         if (!videoElement || videoElement.readyState < 2) return null;
-        this.captureCtx.drawImage(videoElement, 0, 0, this.modelWidth, this.modelHeight);
-        // Optimization: Reduced quality to 0.4 (40%) to save bandwidth and encoding time
-        return this.captureCanvas.toDataURL('image/jpeg', 0.4);
+        
+        let targetWidth = this.modelWidth;
+        let targetHeight = this.modelHeight;
+        
+        // Dynamically shrink screenshare resolution heavily to preserve inference latencies
+        if (sourceType === "screen") {
+           const ratio = videoElement.videoWidth / videoElement.videoHeight;
+           targetHeight = 320;
+           targetWidth = Math.round(320 * ratio);
+        }
+        
+        if (this.captureCanvas.width !== targetWidth || this.captureCanvas.height !== targetHeight) {
+            this.captureCanvas.width = targetWidth;
+            this.captureCanvas.height = targetHeight;
+        }
+
+        this.captureCtx.drawImage(videoElement, 0, 0, targetWidth, targetHeight);
+        
+        // Optimization: Reduced quality intelligently
+        return this.captureCanvas.toDataURL('image/jpeg', sourceType === "screen" ? 0.3 : 0.4);
     }
 
     // STEP 3 — Start render loop after video starts
@@ -108,34 +147,58 @@ export class VideoProcessor {
         if (this.animationId) return;
 
         // Ensure we start when metadata is ready
+        this.isActive = true;
+        this.isRenderingFrame = false;
+        
         if (video.readyState >= 1) {
-            this.render();
+            this.renderLoop();
         } else {
             video.onloadedmetadata = () => {
-                this.render();
+                this.renderLoop();
             };
         }
     }
 
     stopRenderLoop() {
+        this.isActive = false;
         if (this.animationId) {
-            cancelAnimationFrame(this.animationId);
+            clearTimeout(this.animationId);
             this.animationId = null;
         }
     }
 
-    // STEP 2 — Create continuous render loop
-    render() {
+    // STEP 2 — Create continuous background-survivable render loop
+    async renderLoop() {
+        if (!this.isActive) return;
+
+        if (!this.isRenderingFrame) {
+             this.isRenderingFrame = true;
+             try {
+                 this.renderCore();
+             } catch (err) {
+                 console.error("[VideoProcessor] Loop error:", err);
+             }
+             this.isRenderingFrame = false;
+        }
+
+        // Use stable timeout to strictly bypass requestAnimationFrame background pausing
+        // 33ms ~= 30fps
+        this.animationId = setTimeout(() => this.renderLoop(), 33);
+    }
+
+    renderCore() {
         if (!this.video || !this.canvas || this.video.readyState < 2) {
-            this.animationId = requestAnimationFrame(this.render.bind(this));
             return;
         }
 
         const ctx = this.canvas.getContext("2d", { alpha: false });
         const { width, height } = this.canvas;
+        
+        // 0. Ensure canvas resets every frame cleanly
+        ctx.clearRect(0, 0, width, height);
 
         // 1. Calculate Lockdown State (Full Frame Blur)
-        const isInLockdown = Date.now() < this.lockdownUntil;
+        const isInLockdown = Date.now() < this.lockdownUntil || this.isGloballyBlurred;
 
         if (isInLockdown || this.shieldLife > 0) {
             // Strong Lockdown Blur: 30px for total privacy when nudity is seen
@@ -162,11 +225,13 @@ export class VideoProcessor {
             const scaleY = height / this.video.videoHeight;
 
             if (this.blurRegions.length > 0) {
-                this.persistenceBuffer = this.blurRegions.map(r => ({ ...r, life: 10 }));
+                // Expand handling to support ALL multiple regions uniquely by index
+                this.persistenceBuffer = this.blurRegions.map((r, i) => ({ ...r, id: `${r.label}_${i}`, life: 10 }));
             }
 
             this.persistenceBuffer.forEach(region => {
-                let sr = this.smoothedRegions.find(s => s.label === region.label);
+                // Fix Region Overwrite: Use unique .id instead of .label identical matches
+                let sr = this.smoothedRegions.find(s => s.id === region.id);
                 if (!sr) {
                     sr = { ...region, life: region.life };
                     this.smoothedRegions.push(sr);
@@ -185,12 +250,25 @@ export class VideoProcessor {
                 const sw_raw = region.width * backendToVideoX;
                 const sh_raw = region.height * backendToVideoY;
 
-                const x = sx_raw * scaleX;
-                const y = sy_raw * scaleY;
-                const w = sw_raw * scaleX;
-                const h = sh_raw * scaleY;
+                let x = sx_raw * scaleX;
+                let y = sy_raw * scaleY;
+                let w = sw_raw * scaleX;
+                let h = sh_raw * scaleY;
 
-                // Overlay the surgical blur patch
+                // Expand each region significantly (padding 50-80px overlay) to ensure 
+                // absolutely no unblurred slivers escape between fast rendering updates
+                x -= 40;
+                y -= 40;
+                w += 80;
+                h += 80;
+
+                // Normalize coordinates to stay safely inside canvas dimensions
+                x = Math.max(0, x);
+                y = Math.max(0, y);
+                w = Math.min(width - x, w);
+                h = Math.min(height - y, h);
+
+                // Overlay the surgical blur patch seamlessly
                 ctx.filter = "none"; // Reset filter for the patch draw
                 ctx.drawImage(this.blurBuffer, x, y, w, h, x, y, w, h);
 
@@ -212,7 +290,5 @@ export class VideoProcessor {
         }
 
         if (this.shieldLife > 0) this.shieldLife -= 1;
-
-        this.animationId = requestAnimationFrame(this.render.bind(this));
     }
 }
