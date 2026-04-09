@@ -68,17 +68,10 @@ export class VideoProcessor {
     }
 
     // This is called by VideoCall when WebSocket receives message
-    setRegions(regions, maxScore = 0, nsfwScore = 0.0) {
-        // console.log("Regions:", regions, "NSFW:", nsfwScore);
+    setRegions(regions, maxScore = 0, nsfwScore = 0.0, action = "safe") {
         
         // Ensure regions is an array
         this.blurRegions = regions || [];
-
-        // IMPLEMENT NEW DECISION LOGIC:
-        // 1. IF nsfw_score > 0.8: Apply FULL FRAME BLUR
-        // 2. ELSE IF regions.length > 0: Apply REGION BLUR
-        // 3. ELSE IF nsfw_score > 0.7 AND regions.length == 0: Apply FULL FRAME BLUR
-        // 4. ELSE: No blur
         
         // Hysteresis & Smoothing Flags setup
         this.scoreHistory.push(Math.max(maxScore, nsfwScore));
@@ -86,14 +79,14 @@ export class VideoProcessor {
 
         const safeCount = this.scoreHistory.filter(s => s < 0.5).length;
 
-        if (nsfwScore > 0.8 || (nsfwScore > 0.7 && this.blurRegions.length === 0)) {
+        // NEW DECISION LOGIC BASED ON BACKEND RISK ENGINE
+        if (action === "block" || action === "blur" && this.blurRegions.length === 0) {
             this.isGloballyBlurred = true;
             this.lastUnsafeTime = Date.now();
-            this.lockdownUntil = Date.now() + 800; // Force lockdown for high severity
-            this.shieldLife = 5;
-        } else if (this.blurRegions.length > 0) {
-            // Apply region blur normally (global blur is allowed to reset if we have bounded regions)
-            // Time-based reset logic for global blur when we successfully have pure regional targets
+            this.lockdownUntil = Date.now() + (action === "block" ? 1500 : 800); 
+            this.shieldLife = action === "block" ? 15 : 5;
+        } else if (this.blurRegions.length > 0 || action === "blur") {
+            // Apply region blur normally or if action is blur but we have regions
             if (this.isGloballyBlurred && Date.now() - this.lastUnsafeTime > 1500 && safeCount >= 3) {
                  this.isGloballyBlurred = false;
             }
@@ -108,6 +101,13 @@ export class VideoProcessor {
                 this.shieldLife = 0;
             }
         }
+    }
+
+    // Expose robust hysteresis state for UI alerts without flickering
+    hasActiveBlur() {
+        const isLocked = Date.now() < this.lockdownUntil || this.isGloballyBlurred || this.shieldLife > 0;
+        const hasRegions = this.blurRegions.length > 0 || this.smoothedRegions.length > 0;
+        return isLocked || hasRegions;
     }
 
     // Helper to extract frame for backend with dynamic sizing

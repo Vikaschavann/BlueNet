@@ -108,6 +108,8 @@ export default function Room() {
 
   const [aiOn, setAiOn] = useState(true);
   const [audioSanitized, setAudioSanitized] = useState(false);
+  const [showUnsafeAlert, setShowUnsafeAlert] = useState(false);
+  const unsafeAlertRef = useRef(false);
 
   // Initialize AI Video Pipeline globally off-screen
   useEffect(() => {
@@ -141,6 +143,10 @@ export default function Room() {
   // Track what the user has enabled (independent of actual stream)
   const [micEnabled, setMicEnabled] = useState(false);
   const [cameraEnabled, setCameraEnabled] = useState(false);
+  
+  const [engineAction, setEngineAction] = useState(null);
+  const [isCameraBlocked, setIsCameraBlocked] = useState(false);
+  const [riskScore, setRiskScore] = useState(0);
 
   // ============================================================================
   // SYNCHRONIZED REFS (Must be declared AFTER their corresponding useState)
@@ -148,10 +154,12 @@ export default function Room() {
   const aiOnRef = useRef(aiOn);
   const localStreamRef = useRef(localStream);
   const micEnabledRef = useRef(micEnabled);
+  const isCameraBlockedRef = useRef(isCameraBlocked);
 
   useEffect(() => { aiOnRef.current = aiOn; }, [aiOn]);
   useEffect(() => { localStreamRef.current = localStream; }, [localStream]);
   useEffect(() => { micEnabledRef.current = micEnabled; }, [micEnabled]);
+  useEffect(() => { isCameraBlockedRef.current = isCameraBlocked; }, [isCameraBlocked]);
 
   // ============================================================================
   // EFFECTS: ROOM INITIALIZATION
@@ -213,9 +221,20 @@ export default function Room() {
         const proc = videoProcRef.current;
         if (proc) {
             proc.notifyFrameReceived();
-            const latency = Date.now() - proc.lastFrameSentAt;
-            // console.log(`Backend response: ${latency}ms | Score: ${msg.max_score.toFixed(2)}`);
-            proc.setRegions(msg.regions || [], msg.max_score || 0, msg.nsfw_score || 0.0);
+            proc.setRegions(msg.regions || [], msg.max_score || 0, msg.nsfw_score || 0.0, msg.action || "safe");
+            
+            // Map the rigorously smoothed hysteresis state directly to UI without flickering
+            const isActive = proc.hasActiveBlur();
+            if (isActive !== unsafeAlertRef.current) {
+                unsafeAlertRef.current = isActive;
+                setShowUnsafeAlert(isActive);
+            }
+            if (msg.action) {
+                setEngineAction(msg.action);
+            }
+            if (msg.riskScore !== undefined) {
+                setRiskScore(msg.riskScore);
+            }
         }
       }
     });
@@ -224,6 +243,27 @@ export default function Room() {
     moderationWsRef.current = ws;
     return () => ws.disconnect();
   }, [MODERATION_WS]);
+
+  // Handle Auto-Enforcement Actions from Engine
+  useEffect(() => {
+    if (!engineAction) return;
+    
+    if (engineAction === 'mute') {
+       showToast("System muted your microphone due to repeated safety violations.", "error");
+       if (micEnabledRef.current && localStreamRef.current) {
+           localStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = false));
+       }
+    } else if (engineAction === 'block') {
+       showToast("Camera disabled due to high risk or multiple violations.", "error");
+       setIsCameraBlocked(true);
+       if (localStreamRef.current) {
+           localStreamRef.current.getVideoTracks().forEach((t) => (t.enabled = false));
+       }
+    } else if (engineAction === 'remove') {
+       showToast("You have been removed from the room for violating safety policies.", "error");
+       navigate('/');
+    }
+  }, [engineAction, navigate, showToast]);
 
   // Active speaker detection
   useEffect(() => {
@@ -655,6 +695,11 @@ export default function Room() {
   }, [micEnabled, localStream, aiOn, addOrReplaceTrack, renegotiate, showToast]);
 
   const toggleCamera = useCallback(async () => {
+    if (isCameraBlockedRef.current) {
+      showToast('Camera is blocked due to safety violations.', 'error');
+      return;
+    }
+    
     if (isScreenSharing) {
       showToast('Cannot toggle camera while sharing screen', 'error');
       return;
@@ -697,7 +742,11 @@ export default function Room() {
               const frame = proc.extractFrame(rawVideoRef.current, 'webcam');
               if (frame) {
                 proc.notifyFrameSent();
-                moderationWsRef.current.send('video_frame', { frame, source_type: 'webcam' });
+                moderationWsRef.current.send('video_frame', { 
+                  frame, 
+                  source_type: 'webcam',
+                  user_id: selfRef.current?.id || roomId 
+                });
               }
             }
             sendLoopRef.current = setTimeout(loop, 100);
@@ -1053,7 +1102,16 @@ export default function Room() {
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex overflow-hidden relative">
+        
+        {/* Unsafe Alert Overlay Banner */}
+        <div 
+          className={`absolute top-6 left-1/2 transform -translate-x-1/2 z-50 px-6 py-3 rounded-2xl bg-red-500/90 text-white font-semibold backdrop-blur-md shadow-[0_0_20px_rgba(239,68,68,0.4)] border border-red-400/50 flex items-center gap-3 transition-all duration-300 pointer-events-none ${showUnsafeAlert ? 'opacity-100 translate-y-0' : 'opacity-0 -translate-y-4'}`}
+        >
+          <span className="text-xl">⚠️</span>
+          <span>Inappropriate content detected. This stream is being moderated.</span>
+        </div>
+
         {/* Video Grid */}
         <div className="flex-1 p-4 flex flex-col">
           {!connected ? (

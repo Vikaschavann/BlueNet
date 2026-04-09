@@ -63,6 +63,10 @@ async def root():
 async def websocket_endpoint(websocket: WebSocket):
     await ws_handler.handle(websocket)
 
+@app.websocket("/ws/admin")
+async def admin_websocket(websocket: WebSocket):
+    await ws_handler.handle_admin(websocket)
+
 
 @app.websocket("/ws/room/{room_id}")
 async def room_websocket(websocket: WebSocket, room_id: str):
