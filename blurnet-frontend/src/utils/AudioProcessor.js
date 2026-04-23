@@ -12,7 +12,7 @@ export class AudioProcessor {
         this.isMuted = false;
         
         this.mediaRecorder = null;
-        this.chunkDuration = 2000;
+        this.chunkDuration = 4000;
         this.supportedMimeType = null;
     }
 

@@ -1,7 +1,6 @@
 export class VideoProcessor {
     constructor(options = {}) {
-        // Accuracy Boost: Restored to 640x480. 
-        // We use multi-threading on the backend to maintain speed.
+        // Higher resolution needed to detect explicit content on phone screens held up to camera
         this.modelWidth = options.width || 640;
         this.modelHeight = options.height || 480;
 
@@ -29,7 +28,7 @@ export class VideoProcessor {
 
         // Sentinel Engine: Temporal Smoothing (EMA)
         this.smoothedRegions = [];
-        this.smoothingFactor = 0.5; // Optimized for 30fps
+        this.smoothingFactor = 0.85; // Faster tracking to instantly mask sudden movements
 
         // Hysteresis & Smoothing Configuration
         this.scoreHistory = [];
@@ -67,35 +66,52 @@ export class VideoProcessor {
         this.smoothedRegions = [];
     }
 
-    // This is called by VideoCall when WebSocket receives message
+    triggerGlobalBlur(durationMs = 800, severity = 'blur') {
+        this.isGloballyBlurred = true;
+        this.lastUnsafeTime = Date.now();
+        this.lockdownUntil = Date.now() + durationMs;
+        this.shieldLife = severity === 'block' ? 15 : 5;
+    }
+
+    addSurgicalRegion(region, lifeFrames = 10) {
+        // Direct injection into the rendering decay buffer
+        const id = `SURGICAL_${Date.now()}_${Math.random()}`;
+        const sr = { ...region, id, life: lifeFrames };
+        this.smoothedRegions.push(sr);
+    }
+
+    // This is called by VideoCall when WebSocket receives message (backend pipeline)
     setRegions(regions, maxScore = 0, nsfwScore = 0.0, action = "safe") {
-        
-        // Ensure regions is an array
-        this.blurRegions = regions || [];
         
         // Hysteresis & Smoothing Flags setup
         this.scoreHistory.push(Math.max(maxScore, nsfwScore));
         if (this.scoreHistory.length > 5) this.scoreHistory.shift();
 
         const safeCount = this.scoreHistory.filter(s => s < 0.5).length;
+        const hasRegions = regions && regions.length > 0;
 
-        // NEW DECISION LOGIC BASED ON BACKEND RISK ENGINE
-        if (action === "block" || action === "blur" && this.blurRegions.length === 0) {
-            this.isGloballyBlurred = true;
-            this.lastUnsafeTime = Date.now();
-            this.lockdownUntil = Date.now() + (action === "block" ? 1500 : 800); 
-            this.shieldLife = action === "block" ? 15 : 5;
-        } else if (this.blurRegions.length > 0 || action === "blur") {
-            // Apply region blur normally or if action is blur but we have regions
-            if (this.isGloballyBlurred && Date.now() - this.lastUnsafeTime > 1500 && safeCount >= 3) {
-                 this.isGloballyBlurred = false;
-            }
+        if (hasRegions) {
+            // We have precise regions — inject them into the processor cleanly without resetting global state
+            regions.forEach((r, i) => {
+                let sr = this.smoothedRegions.find(s => s.id === `${r.label}_BACKEND_${i}`);
+                if (!sr) {
+                    this.smoothedRegions.push({ ...r, id: `${r.label}_BACKEND_${i}`, life: 10 });
+                } else {
+                    sr.x = sr.x + this.smoothingFactor * (r.x - sr.x);
+                    sr.y = sr.y + this.smoothingFactor * (r.y - sr.y);
+                    sr.width = sr.width + this.smoothingFactor * (r.width - sr.width);
+                    sr.height = sr.height + this.smoothingFactor * (r.height - sr.height);
+                    sr.life = 10;
+                }
+            });
+        } else if (action === "block") {
+            this.triggerGlobalBlur(1500, 'block');
+        } else if (action === "blur") {
+            this.triggerGlobalBlur(800, 'blur');
         } else {
-            // No blur needed, cleanly reset
+            // Safe — cleanly reset if enough safe history
             if (Date.now() - this.lastUnsafeTime > 1500 && safeCount >= 3) {
                 this.isGloballyBlurred = false;
-                this.blurRegions = [];
-                this.persistenceBuffer = [];
                 this.smoothedRegions = [];
                 this.lockdownUntil = 0;
                 this.shieldLife = 0;
@@ -120,8 +136,8 @@ export class VideoProcessor {
         // Dynamically shrink screenshare resolution heavily to preserve inference latencies
         if (sourceType === "screen") {
            const ratio = videoElement.videoWidth / videoElement.videoHeight;
-           targetHeight = 320;
-           targetWidth = Math.round(320 * ratio);
+           targetHeight = 240;
+           targetWidth = Math.round(240 * ratio);
         }
         
         if (this.captureCanvas.width !== targetWidth || this.captureCanvas.height !== targetHeight) {
@@ -131,8 +147,8 @@ export class VideoProcessor {
 
         this.captureCtx.drawImage(videoElement, 0, 0, targetWidth, targetHeight);
         
-        // Optimization: Reduced quality intelligently
-        return this.captureCanvas.toDataURL('image/jpeg', sourceType === "screen" ? 0.3 : 0.4);
+        // Higher JPEG quality to preserve detail on small embedded screens (phones held to camera)
+        return this.captureCanvas.toDataURL('image/jpeg', sourceType === "screen" ? 0.35 : 0.55);
     }
 
     // STEP 3 — Start render loop after video starts
@@ -162,7 +178,7 @@ export class VideoProcessor {
     stopRenderLoop() {
         this.isActive = false;
         if (this.animationId) {
-            clearTimeout(this.animationId);
+            cancelAnimationFrame(this.animationId);
             this.animationId = null;
         }
     }
@@ -181,9 +197,8 @@ export class VideoProcessor {
              this.isRenderingFrame = false;
         }
 
-        // Use stable timeout to strictly bypass requestAnimationFrame background pausing
-        // 33ms ~= 30fps
-        this.animationId = setTimeout(() => this.renderLoop(), 33);
+        // Use native display refresh rates to eradicate visual stuttering 
+        this.animationId = requestAnimationFrame(() => this.renderLoop());
     }
 
     renderCore() {
@@ -197,22 +212,22 @@ export class VideoProcessor {
         // 0. Ensure canvas resets every frame cleanly
         ctx.clearRect(0, 0, width, height);
 
-        // 1. Calculate Lockdown State (Full Frame Blur)
+        // 1. Check Lockdown State (Full Frame Blur — only when NO regions exist)
         const isInLockdown = Date.now() < this.lockdownUntil || this.isGloballyBlurred;
 
-        if (isInLockdown || this.shieldLife > 0) {
-            // Strong Lockdown Blur: 30px for total privacy when nudity is seen
+        if ((isInLockdown || this.shieldLife > 0) && this.blurRegions.length === 0 && this.smoothedRegions.length === 0) {
+            // Full-screen blur ONLY as fallback when no targeted regions exist
             ctx.filter = "blur(30px)";
         } else {
             ctx.filter = "none";
         }
 
-        // 2. Draw Video Frame (Subject to Lockdown filter)
+        // 2. Draw Video Frame (clean or full-blur depending on lockdown)
         ctx.drawImage(this.video, 0, 0, width, height);
 
         // 3. Selective Regional Blur (Secondary Layer of Safety)
         // We do this even during lockdown for redundant masking of the source
-        const hasRegions = this.blurRegions.length > 0 || this.smoothedRegions.length > 0;
+        const hasRegions = this.smoothedRegions.length > 0;
 
         if (hasRegions) {
             const bCtx = this.blurBufferCtx;
@@ -223,26 +238,6 @@ export class VideoProcessor {
             const backendToVideoY = this.video.videoHeight / this.modelHeight;
             const scaleX = width / this.video.videoWidth;
             const scaleY = height / this.video.videoHeight;
-
-            if (this.blurRegions.length > 0) {
-                // Expand handling to support ALL multiple regions uniquely by index
-                this.persistenceBuffer = this.blurRegions.map((r, i) => ({ ...r, id: `${r.label}_${i}`, life: 10 }));
-            }
-
-            this.persistenceBuffer.forEach(region => {
-                // Fix Region Overwrite: Use unique .id instead of .label identical matches
-                let sr = this.smoothedRegions.find(s => s.id === region.id);
-                if (!sr) {
-                    sr = { ...region, life: region.life };
-                    this.smoothedRegions.push(sr);
-                } else {
-                    sr.x = sr.x + this.smoothingFactor * (region.x - sr.x);
-                    sr.y = sr.y + this.smoothingFactor * (region.y - sr.y);
-                    sr.width = sr.width + this.smoothingFactor * (region.width - sr.width);
-                    sr.height = sr.height + this.smoothingFactor * (region.height - sr.height);
-                    sr.life = region.life;
-                }
-            });
 
             this.smoothedRegions.forEach((region) => {
                 const sx_raw = region.x * backendToVideoX;
@@ -255,12 +250,13 @@ export class VideoProcessor {
                 let w = sw_raw * scaleX;
                 let h = sh_raw * scaleY;
 
-                // Expand each region significantly (padding 50-80px overlay) to ensure 
-                // absolutely no unblurred slivers escape between fast rendering updates
-                x -= 40;
-                y -= 40;
-                w += 80;
-                h += 80;
+                // Proportional padding (15% of region size) instead of fixed pixels
+                const padX = w * 0.15;
+                const padY = h * 0.15;
+                x -= padX;
+                y -= padY;
+                w += padX * 2;
+                h += padY * 2;
 
                 // Normalize coordinates to stay safely inside canvas dimensions
                 x = Math.max(0, x);
@@ -269,24 +265,13 @@ export class VideoProcessor {
                 h = Math.min(height - y, h);
 
                 // Overlay the surgical blur patch seamlessly
-                ctx.filter = "none"; // Reset filter for the patch draw
+                ctx.filter = "none";
                 ctx.drawImage(this.blurBuffer, x, y, w, h, x, y, w, h);
-
-                // Professional debug indicator
-                ctx.strokeStyle = "rgba(255, 0, 0, 0.4)";
-                ctx.lineWidth = 2;
-                ctx.strokeRect(x, y, w, h);
 
                 region.life -= 1;
             });
 
-            // FIX CANVAS PROCESSING LOOP: Decay the persistence buffer too!
-            this.persistenceBuffer.forEach(region => {
-                region.life -= 1; 
-            });
-
             this.smoothedRegions = this.smoothedRegions.filter(r => r.life > 0);
-            this.persistenceBuffer = this.persistenceBuffer.filter(r => r.life > 0);
         }
 
         if (this.shieldLife > 0) this.shieldLife -= 1;

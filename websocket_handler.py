@@ -15,8 +15,8 @@ class WebSocketHandler:
     def __init__(self, video_mod: VideoModerator, audio_mod: AudioModerator):
         self.video_mod = video_mod
         self.audio_mod = audio_mod
-        # Optimization: Use a dedicated thread pool for AI inference to utilize 8 cores
-        self.executor = ThreadPoolExecutor(max_workers=8)
+        # Optimization: Use smaller thread pool to reduce context switching overhead
+        self.executor = ThreadPoolExecutor(max_workers=4)
         
         # Admin Dashboard State
         self.connected_users = {}
@@ -32,7 +32,7 @@ class WebSocketHandler:
             img_bytes = base64.b64decode(base64_frame)
             nparr = np.frombuffer(img_bytes, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE) # Grayscale for bypass detection
-            return cv2.resize(frame, (64, 64)) # Downsample for fast processing
+            return cv2.resize(frame, (32, 32)) # Downsample aggressively for fast processing
         except Exception:
             return None
 
@@ -139,14 +139,13 @@ class WebSocketHandler:
                             
                             frames_history = self.connected_users[user_id]["last_frames"]
                             frames_history.append(small_frame)
-                            if len(frames_history) > 3:
+                            if len(frames_history) > 2:
                                 frames_history.pop(0)
                             
-                            if len(frames_history) == 3 and not bypass_detected:
-                                # Check structural similarity manually (frozen frame)
-                                diff1 = cv2.absdiff(frames_history[0], frames_history[1])
-                                diff2 = cv2.absdiff(frames_history[1], frames_history[2])
-                                if np.mean(diff1) < 2 and np.mean(diff2) < 2:
+                            if len(frames_history) == 2 and not bypass_detected:
+                                # Check structural similarity (frozen frame) with just 2 frames
+                                diff = cv2.absdiff(frames_history[0], frames_history[1])
+                                if np.mean(diff) < 2:
                                     bypass_detected = True
                                     bypass_type = "frozen"
                         
