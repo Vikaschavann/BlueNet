@@ -51,6 +51,47 @@ class VideoModerator:
                 nsfw_score = self.nsfw_model.predict(pil_img)
             except Exception as e:
                 print(f"[NSFW Model Error] {e}")
+                
+        regions = []
+        is_unsafe = False
+        max_score = 0
+        centroids = [] # List of (x, y) for clustering analysis
+
+        # STEP 2c: Mobile Screen / Picture-in-Picture Detection (Texture Clustering)
+        # Identifies smaller rectangular screens in the feed to specifically blur them
+        if self.nsfw_model:
+            try:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                edges = cv2.Canny(gray, 50, 150)
+                dilated = cv2.dilate(edges, None, iterations=8)
+                contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                img_h, img_w = frame.shape[:2]
+                min_area = (img_w * img_h) * 0.05 
+                
+                valid_cnts = [c for c in contours if cv2.contourArea(c) > min_area]
+                valid_cnts = sorted(valid_cnts, key=cv2.contourArea, reverse=True)[:3]
+                
+                for cnt in valid_cnts:
+                    cx, cy, cw, ch = cv2.boundingRect(cnt)
+                    px, py = int(cw * 0.1), int(ch * 0.1)
+                    x1, y1 = max(0, cx - px), max(0, cy - py)
+                    x2, y2 = min(img_w, cx + cw + px), min(img_h, cy + ch + py)
+                    
+                    crop_rgb = frame_rgb[y1:y2, x1:x2]
+                    crop_pil = Image.fromarray(crop_rgb)
+                    crop_score = self.nsfw_model.predict(crop_pil)
+                    
+                    if crop_score > 0.40:
+                        is_unsafe = True
+                        max_score = max(max_score, crop_score)
+                        regions.append({
+                            "x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1,
+                            "label": "EXPLICIT_SCREEN", "confidence": crop_score
+                        })
+                        print(f"[SENTINEL] Mobile Screen Blocked! Crop Score: {crop_score:.3f}")
+            except Exception as e:
+                print(f"[Screen Detect Error] {e}")
         
         target_labels = {
             'EXPOSED_BREAST_F', 'EXPOSED_GENITALIA_F', 'EXPOSED_GENITALIA_M', 
@@ -62,19 +103,14 @@ class VideoModerator:
             'FEMALE_GENITALIA_COVERED', 'FEMALE_BREAST_COVERED', 'BUTTOCKS_COVERED', 'ANUS_COVERED'
         }
         
-        regions = []
-        is_unsafe = False
-        max_score = 0
-        centroids = [] # List of (x, y) for clustering analysis
-        
         for d in detections:
             try:
                 label = d.get('label') or d.get('class')
                 score = float(d['score'])
                 max_score = max(max_score, score)
                 
-                # Dynamic Thresholding: Even more aggressive for the Sentinel Engine
-                base_threshold = 0.10 if "EXPOSED" in label else 0.22
+                # Dynamic Thresholding: Extra sensitive to catch content shown via small mobile screens
+                base_threshold = 0.08 if "EXPOSED" in label else 0.15
                 
                 if label in target_labels and score > base_threshold:
                     is_unsafe = True
@@ -88,7 +124,11 @@ class VideoModerator:
 
                     # Expansion with Contextual Intelligence
                     expansion = 0.55 if "COVERED" in label else 0.45
-                    pw, ph = w * expansion, h * expansion
+                    
+                    # ENHANCEMENT: Minimum absolute padding (40px) to ensure small detections 
+                    # (like a phone screen held up to the camera) are fully covered by the blur patch
+                    pw = max(40, w * expansion)
+                    ph = max(40, h * expansion)
                     
                     regions.append({
                         "x": int(max(0, x - pw/2)),
@@ -119,9 +159,20 @@ class VideoModerator:
                         # print(f"[SENTINEL] Interaction detected (dist={dist:.1f}px). Safety Override engaged.")
                         break
 
-        # Override Unified Safety Flag
-        if nsfw_score > 0.7 or len(regions) > 0:
+        # Override Unified Safety Flag (Hyper-sensitive for 'picture-in-picture' phone screens)
+        if nsfw_score > 0.35 or len(regions) > 0:
             is_unsafe = True
+
+        # FAILSAFE: If NSFW detected but no specific regions found, create a full-frame region
+        # This ensures the frontend ALWAYS gets coordinates to blur instead of relying on 
+        # a generic global blur that may not visually cover the phone screen
+        if is_unsafe and len(regions) == 0:
+            img_h, img_w = frame.shape[:2]
+            regions.append({
+                "x": 0, "y": 0, "width": img_w, "height": img_h,
+                "label": "GLOBAL_NSFW", "confidence": max(nsfw_score, max_score)
+            })
+            print(f"[SENTINEL] No regions but NSFW={nsfw_score:.3f}, injecting full-frame region")
 
         print(f"NSFW Score: {nsfw_score:.4f}")
         print(f"Regions detected: {len(regions)}")

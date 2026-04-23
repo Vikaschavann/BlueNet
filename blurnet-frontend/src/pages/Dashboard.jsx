@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
 
 function shortId() {
   const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -10,7 +11,10 @@ function shortId() {
 
 const Dashboard = () => {
   const navigate = useNavigate();
+  const { user, logout } = useAuth();
   const [code, setCode] = useState('');
+  const [newRoomId, setNewRoomId] = useState(null);
+  const [copied, setCopied] = useState(false);
 
   const join = () => {
     const raw = code.trim();
@@ -19,6 +23,22 @@ const Dashboard = () => {
     const room = (m?.[1] || raw).toLowerCase();
     navigate(`/room/${room}`);
   };
+
+  const createMeeting = () => {
+    const id = shortId();
+    setNewRoomId(id);
+  };
+
+  const copyAndJoin = () => {
+    const link = `${window.location.origin}/room/${newRoomId}`;
+    navigator.clipboard.writeText(link);
+    setCopied(true);
+    setTimeout(() => navigate(`/room/${newRoomId}`), 600);
+  };
+
+  const userInitials = user?.name
+    ? user.name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2)
+    : '?';
 
   return (
     <div className="min-h-screen bg-slate-950 text-white flex flex-col">
@@ -31,7 +51,10 @@ const Dashboard = () => {
         </Link>
         <div className="flex items-center gap-6 text-slate-400">
           <span>{new Date().toLocaleString('en-US', { hour: 'numeric', minute: 'numeric', weekday: 'short', month: 'short', day: 'numeric' })}</span>
-          <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center text-sm font-bold text-white">JD</div>
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-full bg-brand-primary/20 border border-brand-primary/30 flex items-center justify-center text-sm font-bold text-brand-primary">{userInitials}</div>
+            <button onClick={logout} className="text-sm text-slate-500 hover:text-white transition">Logout</button>
+          </div>
         </div>
       </header>
       
@@ -44,20 +67,54 @@ const Dashboard = () => {
           <p className="text-slate-400 text-xl mb-12 max-w-lg">
             We re-engineered the service we built for secure business meetings to make it free and available for all.
           </p>
-          <div className="flex gap-6">
-            <Link to={`/room/${shortId()}`} className="bg-brand-primary px-6 py-3 rounded-brand font-semibold flex items-center gap-2 hover:bg-blue-600 transition">
-              New meeting
-            </Link>
-            <div className="flex bg-slate-900 border border-slate-800 rounded-brand p-1">
-              <input
-                value={code}
-                onChange={(e) => setCode(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && join()}
-                placeholder="Enter a code or link"
-                className="bg-transparent px-4 outline-none w-64"
-              />
+          <div className="flex flex-col gap-6">
+            <div className="flex gap-4 items-center">
+              <button onClick={createMeeting} className="bg-brand-primary px-6 py-3 rounded-brand font-semibold flex items-center gap-2 hover:bg-blue-600 transition">
+                + New meeting
+              </button>
+              <div className="flex bg-slate-900 border border-slate-800 rounded-brand p-1">
+                <input
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && join()}
+                  placeholder="Enter a code or link"
+                  className="bg-transparent px-4 outline-none w-64"
+                />
+              </div>
+              <button onClick={join} disabled={!code.trim()} className={`font-semibold transition ${code.trim() ? 'text-brand-primary hover:text-white' : 'text-slate-600 cursor-not-allowed'}`}>Join</button>
             </div>
-            <button onClick={join} className="text-slate-400 font-semibold hover:text-white">Join</button>
+
+            {/* New Meeting Created Card */}
+            {newRoomId && (
+              <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 max-w-lg animate-fadeIn">
+                <div className="text-sm text-slate-400 mb-3">Your meeting is ready! Share this link with others:</div>
+                <div className="flex items-center gap-2 bg-slate-950 rounded-xl px-4 py-3 border border-slate-800">
+                  <span className="text-sm font-mono text-slate-300 truncate flex-1">
+                    {window.location.origin}/room/{newRoomId}
+                  </span>
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(`${window.location.origin}/room/${newRoomId}`);
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 2000);
+                    }}
+                    className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-all ${
+                      copied
+                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                        : 'bg-slate-800 hover:bg-slate-700 text-white border border-slate-700'
+                    }`}
+                  >
+                    {copied ? '✓ Copied' : 'Copy'}
+                  </button>
+                </div>
+                <button
+                  onClick={copyAndJoin}
+                  className="mt-4 w-full py-3 bg-brand-primary hover:bg-blue-600 rounded-xl font-semibold transition text-center"
+                >
+                  Copy Link & Join Meeting →
+                </button>
+              </div>
+            )}
           </div>
         </div>
         <div className="w-1/2 flex flex-col items-center">
@@ -65,7 +122,7 @@ const Dashboard = () => {
             <img src="https://images.unsplash.com/photo-1580489944761-15a19d654956?auto=format&fit=crop&w=400" className="w-full h-full object-cover" />
           </div>
           <h3 className="mt-8 text-2xl font-bold">Get a link you can share</h3>
-          <p className="text-slate-400 mt-2 text-center">Click New meeting to get a link you can send to people.</p>
+          <p className="text-slate-400 mt-2 text-center">Click New meeting to get a link you can send to people you want to meet with.</p>
         </div>
       </main>
     </div>

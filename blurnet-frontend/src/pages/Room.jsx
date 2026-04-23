@@ -9,10 +9,10 @@
  * 5. Add tracks dynamically via addTrack/replaceTrack
  * 
  * USER FLOW:
- * - Join room → Can see peers immediately (no permission prompt)
- * - Click "Enable Camera" → Request camera permission
- * - Click "Enable Mic" → Request mic permission
- * - Click "Share Screen" → Request screen permission
+ * - Join room â†’ Can see peers immediately (no permission prompt)
+ * - Click "Enable Camera" â†’ Request camera permission
+ * - Click "Enable Mic" â†’ Request mic permission
+ * - Click "Share Screen" â†’ Request screen permission
  * 
  * If permission denied:
  * - Show error toast
@@ -22,7 +22,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { Mic, MicOff, Video, VideoOff, MonitorUp, PhoneMissed, MessageSquare, ShieldAlert, UserRound } from 'lucide-react';
+import { Mic, MicOff, Video, VideoOff, MonitorUp, PhoneMissed, MessageSquare, ShieldAlert, UserRound, Copy, Users, Check, Crown, PanelRightOpen } from 'lucide-react';
 import { RoomSocket } from '../utils/RoomSocket';
 import { 
   createPeerConnection, 
@@ -34,6 +34,10 @@ import { WebSocketClient } from '../utils/WebSocketClient';
 import { AudioProcessor } from '../utils/AudioProcessor';
 import { useMediaPermissions } from '../hooks/useMediaPermissions';
 import { VideoProcessor } from '../utils/VideoProcessor';
+import { useNsfwDetector, getNsfwModel } from '../hooks/useNsfwDetector';
+import { useObjectDetector } from '../hooks/useObjectDetector';
+import { useAuth } from '../context/AuthContext';
+import '../styles/meet.css';
 
 function shortId() {
   const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -45,6 +49,7 @@ function shortId() {
 export default function Room() {
   const { roomId } = useParams();
   const navigate = useNavigate();
+  const { user } = useAuth();
 
   const SIGNAL_BASE = useMemo(
     () => import.meta.env.VITE_SIGNALING_WS_BASE || 'ws://localhost:8000/ws/room',
@@ -78,6 +83,11 @@ export default function Room() {
   const [peers, setPeers] = useState([]);
   const [connected, setConnected] = useState(false);
   const [hasJoinedRoom, setHasJoinedRoom] = useState(false);
+  const [roomFull, setRoomFull] = useState(false);
+  const [participantCount, setParticipantCount] = useState(0);
+  const [maxPeers] = useState(12);
+  const [linkCopied, setLinkCopied] = useState(false);
+  const [participantsOpen, setParticipantsOpen] = useState(false);
   const selfRef = useRef(null);
   const pendingPeerIdsRef = useRef(new Set());
   const pendingSignalsRef = useRef(new Map());
@@ -129,6 +139,7 @@ export default function Room() {
     };
   }, []);
 
+
   // ============================================================================
   // UI STATE
   // ============================================================================
@@ -161,6 +172,78 @@ export default function Room() {
   useEffect(() => { micEnabledRef.current = micEnabled; }, [micEnabled]);
   useEffect(() => { isCameraBlockedRef.current = isCameraBlocked; }, [isCameraBlocked]);
 
+  // CLIENT-SIDE NSFW DETECTION — Fast in-browser first-pass using TensorFlow.js + nsfwjs
+  // This catches explicit content (including phones showing porn) within ~50ms
+  const handleClientNsfw = useCallback((result) => {
+    const proc = videoProcRef.current;
+    if (!proc) return;
+    console.log(`[NSFW.js] Client-side detection: ${result.category} @ ${(result.nsfwScore * 100).toFixed(1)}%`);
+    proc.triggerGlobalBlur(800, 'blur');
+    if (!unsafeAlertRef.current) {
+      unsafeAlertRef.current = true;
+      setShowUnsafeAlert(true);
+    }
+  }, []);
+
+  const { isLoading: nsfwModelLoading } = useNsfwDetector(
+    rawVideoRef,
+    { enabled: aiOn && cameraEnabled, interval: 300, onUnsafe: handleClientNsfw }
+  );
+
+  // YOLO OBJECT DETECTION — specifically looking for cell phones
+  const yoloDetectionsRef = useRef([]);
+  const { isLoading: objModelLoading } = useObjectDetector(
+    rawVideoRef,
+    { 
+      enabled: cameraEnabled, 
+      interval: 500, 
+      targetClass: 'cell phone',
+      onDetect: (detections) => {
+        yoloDetectionsRef.current = detections;
+      },
+      onCrops: (crops) => {
+        getNsfwModel().then(async (nsfwModel) => {
+          const tf = await import('@tensorflow/tfjs');
+          for (const crop of crops) {
+            try {
+              // 1. Run NSFW classification on the cropped tensor
+              const predictions = await nsfwModel.classify(crop.tensor, 5);
+              
+              // 2. Tally NSFW score
+              const nsfwCategories = ['Porn', 'Sexy', 'Hentai'];
+              const nsfwPreds = predictions.filter(p => nsfwCategories.includes(p.className));
+              const topNsfw = nsfwPreds.reduce((max, p) => p.probability > max.probability ? p : max, { className: 'None', probability: 0 });
+              
+              const isUnsafe = topNsfw.probability > 0.5;
+
+              // 3. Mark the region unsafe via surgical blur
+              if (isUnsafe) {
+                console.log(`[PIPELINE] 🚨 NSFW PHONE DETECTED: ${topNsfw.className} at ${(topNsfw.probability * 100).toFixed(1)}%`);
+                
+                const proc = videoProcRef.current;
+                if (proc) {
+                  const [x, y, w, h] = crop.bbox;
+                  proc.addSurgicalRegion({ x, y, width: w, height: h, label: 'NSFW_PHONE', confidence: topNsfw.probability }, 15);
+                }
+
+                if (!unsafeAlertRef.current) {
+                  unsafeAlertRef.current = true;
+                  setShowUnsafeAlert(true);
+                }
+              }
+            } catch (err) {
+              console.error("[PIPELINE] Failed classifying crop:", err);
+            } finally {
+              // ALWAYS clean up WebGL memory
+              tf.dispose(crop.tensor);
+            }
+          }
+        });
+      }
+    }
+  );
+
+
   // ============================================================================
   // EFFECTS: ROOM INITIALIZATION
   // ============================================================================
@@ -189,6 +272,10 @@ export default function Room() {
         await roomSocket.connect();
         console.log('[ROOM] Connected to signaling');
         setConnected(true);
+        // Send authenticated user's display name
+        if (user?.name) {
+          roomSocket.send('set_name', { displayName: user.name });
+        }
       } catch (err) {
         console.error('[ROOM] Signaling connection failed:', err);
         showToast('Failed to join room', 'error');
@@ -300,9 +387,16 @@ export default function Room() {
       const type = msg?.type;
       const data = msg?.data || {};
 
+      if (type === 'room_full') {
+        setRoomFull(true);
+        showToast(`Room is full (max ${data.maxPeers} participants)`, 'error');
+        return;
+      }
+
       if (type === 'room_joined') {
         setSelf(data.self);
         setPeers(data.peers || []);
+        setParticipantCount(data.peerCount || (data.peers || []).length + 1);
         const selfId = data.self?.id;
         (data.peers || []).forEach((p) => {
           politeRef.current.set(p.id, selfId > p.id);
@@ -318,21 +412,26 @@ export default function Room() {
       if (type === 'peer_joined') {
         const p = data.peer;
         setPeers((prev) => (prev.some((x) => x.id === p.id) ? prev : [...prev, p]));
+        if (data.peerCount) setParticipantCount(data.peerCount);
+        else setParticipantCount((prev) => prev + 1);
         const curSelf = selfRef.current;
         if (curSelf?.id) politeRef.current.set(p.id, curSelf.id > p.id);
         ensurePeer(p.id);
+        showToast(`${p.displayName || 'Someone'} joined the meeting`, 'info');
         return;
       }
 
       if (type === 'peer_left') {
         const pid = data.peerId;
         setPeers((prev) => prev.filter((p) => p.id !== pid));
+        setParticipantCount((prev) => Math.max(1, prev - 1));
         setStreams((prev) => {
           const copy = { ...prev };
           delete copy[pid];
           return copy;
         });
         closePeer(pid);
+        showToast('A participant left the meeting', 'info');
         return;
       }
 
@@ -345,6 +444,22 @@ export default function Room() {
 
       if (type === 'chat') {
         setChat((prev) => [...prev, { from: data.from, text: data.text, ts: Date.now() }]);
+        return;
+      }
+
+      if (type === 'peer_updated') {
+        const updatedPeer = data.peer;
+        setPeers((prev) => prev.map((p) =>
+          p.id === updatedPeer.id ? { ...p, ...updatedPeer } : p
+        ));
+        return;
+      }
+
+      if (type === 'host_changed') {
+        const hostId = data.hostId;
+        setPeers((prev) => prev.map((p) => ({ ...p, isHost: p.id === hostId })));
+        setSelf((prev) => prev ? { ...prev, isHost: prev.id === hostId } : prev);
+        showToast('Host has changed', 'info');
         return;
       }
 
@@ -719,7 +834,7 @@ export default function Room() {
         videoProcRef.current.startRenderLoop(rawVideoRef.current, processedCanvasRef.current);
 
         // Capture proxy track implicitly
-        const processedStream = processedCanvasRef.current.captureStream(30);
+        const processedStream = processedCanvasRef.current.captureStream(15);
         const processedTrack = processedStream.getVideoTracks()[0];
 
         // Start async interception sending loop safely
@@ -734,8 +849,8 @@ export default function Room() {
             if (!proc) return;
             const now = Date.now();
             if (proc.isBackendProcessing) {
-              if (now - proc.lastFrameSentAt > 500) {
-                 console.log("Failsafe: Backend lagging >500ms");
+              if (now - proc.lastFrameSentAt > 1500) {
+                 console.log("Failsafe: Backend lagging >1500ms");
                  proc.triggerFailsafeBlur();
               }
             } else if (aiOnRef.current && moderationWsRef.current?.isConnected) {
@@ -749,7 +864,7 @@ export default function Room() {
                 });
               }
             }
-            sendLoopRef.current = setTimeout(loop, 100);
+            sendLoopRef.current = setTimeout(loop, 150);
           };
           loop();
         }
@@ -861,8 +976,8 @@ export default function Room() {
           if (!proc) return;
           const now = Date.now();
           if (proc.isBackendProcessing) {
-            if (now - proc.lastFrameSentAt > 500) {
-               console.log("Failsafe: Backend lagging >500ms");
+            if (now - proc.lastFrameSentAt > 1500) {
+               console.log("Failsafe: Backend lagging >1500ms");
                proc.triggerFailsafeBlur();
             }
           } else if (aiOnRef.current && moderationWsRef.current?.isConnected) {
@@ -931,7 +1046,7 @@ export default function Room() {
 
     try {
       const display = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
+        video: { frameRate: { ideal: 60, max: 60 } },
         audio: false,
       });
       const screenTrack = display.getVideoTracks()[0];
@@ -1037,316 +1152,255 @@ export default function Room() {
   // RENDERING
   // ============================================================================
 
+  // Helper to get a peer's display name by ID
+  const getPeerName = useCallback((peerId) => {
+    if (peerId === self?.id) return user?.name || 'You';
+    const peer = peers.find((p) => p.id === peerId);
+    return peer?.displayName || peerId?.slice(0, 6) || 'Unknown';
+  }, [self, peers, user]);
+
   // Separate local tile from remote tiles to power the PiP engine
   const remoteTiles = useMemo(() => {
     return peers.map((p) => ({
       id: p.id,
       label: p.displayName || p.id.slice(0, 6),
+      isHost: p.isHost || false,
       stream: streams[p.id] || null,
       muted: false,
       mediaState: peerMediaState[p.id] || {}
     }));
   }, [peers, streams, peerMediaState]);
 
-  const getGridClass = (count) => {
-    if (count === 0) return 'flex flex-col items-center justify-center';
-    if (count === 1) return 'grid-cols-1 max-w-5xl mx-auto w-full';
-    if (count === 2) return 'grid-cols-2 max-w-6xl mx-auto w-full';
-    if (count <= 4) return 'grid-cols-2 grid-rows-2 max-w-6xl mx-auto w-full';
-    if (count <= 6) return 'grid-cols-3 grid-rows-2 max-w-7xl mx-auto w-full';
-    return 'grid-cols-auto-fit min-[300px]'; // generic wrapping
+  const getGridLayout = (count) => {
+    if (count <= 1) return { cols: 1, rows: 1 };
+    if (count === 2) return { cols: 2, rows: 1 };
+    if (count <= 4) return { cols: 2, rows: 2 };
+    if (count <= 6) return { cols: 3, rows: 2 };
+    if (count <= 9) return { cols: 3, rows: 3 };
+    return { cols: 4, rows: 3 };
   };
 
   const hasLocalMedia = cameraEnabled || micEnabled;
+  const totalTiles = remoteTiles.length;
+  const { cols, rows } = getGridLayout(totalTiles);
+  const timeString = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
 
   return (
-    <div className="h-screen bg-slate-950 text-white flex flex-col overflow-hidden">
-      {/* Header */}
-      <div className="px-5 py-4 flex items-center justify-between border-b border-slate-900">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 bg-brand-primary rounded-xl flex items-center justify-center font-black">
-            B
+    <div className="meet-room">
+      {/* â”€â”€ Top Bar â”€â”€ */}
+      <div className="meet-topbar">
+        <div className="meet-topbar-left">
+          <div className="meet-logo">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <rect width="24" height="24" rx="6" fill="#4285F4"/>
+              <path d="M7 8.5V15.5H12.5L15 13V11L12.5 8.5H7Z" fill="white"/>
+              <path d="M15 11L18 8.5V15.5L15 13V11Z" fill="white" opacity="0.8"/>
+            </svg>
+            <span className="meet-title">BlurNet Meet</span>
           </div>
-          <div>
-            <div className="font-bold">BLURNET Meet</div>
-            <div className="text-xs text-slate-400 flex items-center gap-2">
-              <span className="font-mono">Room: {roomId}</span>
-              <span
-                className={`ml-2 ${
-                  connected ? 'text-emerald-400' : 'text-slate-500'
-                }`}
-              >
-                {connected ? 'Connected' : 'Connecting…'}
-              </span>
-            </div>
+          <div className="meet-divider-v" />
+          <div className="meet-info-pills">
+            <span className="meet-time">{timeString}</span>
+            <span className="meet-room-code">{roomId}</span>
+            <button className="meet-copy-btn" onClick={() => { navigator.clipboard.writeText(window.location.href); setLinkCopied(true); showToast('Meeting link copied!', 'success'); setTimeout(() => setLinkCopied(false), 2000); }} title="Copy meeting link">
+              {linkCopied ? <Check className="w-4 h-4" style={{color:'#34a853'}} /> : <Copy className="w-4 h-4" />}
+            </button>
           </div>
         </div>
-        <div className="flex items-center gap-3 text-sm">
-          <button
-            onClick={() => setAiOn((v) => !v)}
-            className={`px-3 py-1.5 rounded-xl border ${
-              aiOn
-                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-                : 'border-slate-800 bg-slate-900 text-slate-400'
-            }`}
-          >
-            AI {aiOn ? 'On' : 'Off'}
+        <div className="meet-topbar-right">
+          <button onClick={() => setAiOn((v) => !v)} className={`meet-pill ${aiOn ? 'meet-pill-active' : ''}`}>
+            <ShieldAlert className="w-4 h-4" /> AI {aiOn ? 'On' : 'Off'}
           </button>
-          <button
-            onClick={() => setChatOpen((v) => !v)}
-            className="px-3 py-1.5 rounded-xl border border-slate-800 bg-slate-900 hover:bg-slate-800"
-          >
-            Chat
-          </button>
+          <div className="meet-pill"><Users className="w-4 h-4" /><span>{participantCount}</span></div>
         </div>
       </div>
 
-      {/* Main Content */}
-      <div className="flex-1 flex overflow-hidden relative">
-        
-        {/* Unsafe Alert Overlay Banner */}
-        <div 
-          className={`absolute top-6 left-1/2 transform -translate-x-1/2 z-50 px-6 py-3 rounded-2xl bg-red-500/90 text-white font-semibold backdrop-blur-md shadow-[0_0_20px_rgba(239,68,68,0.4)] border border-red-400/50 flex items-center gap-3 transition-all duration-300 pointer-events-none ${showUnsafeAlert ? 'opacity-100 translate-y-0' : 'opacity-0 -translate-y-4'}`}
-        >
-          <span className="text-xl">⚠️</span>
-          <span>Inappropriate content detected. This stream is being moderated.</span>
-        </div>
+      {/* â”€â”€ Alert â”€â”€ */}
+      <div className={`meet-alert ${showUnsafeAlert ? 'meet-alert-show' : ''}`}>
+        <span>âš ï¸</span><span>Content moderated â€” inappropriate content detected</span>
+      </div>
 
-        {/* Video Grid */}
-        <div className="flex-1 p-4 flex flex-col">
-          {!connected ? (
-            <div className="flex-1 flex items-center justify-center">
-              <div className="text-center">
-                <div className="text-lg font-semibold mb-2">Connecting to room…</div>
-                <div className="text-slate-400">Please wait while we establish the connection</div>
+      {/* â”€â”€ Stage â”€â”€ */}
+      <div className="meet-stage">
+        {roomFull ? (
+          <div className="meet-empty-state">
+            <div className="meet-empty-icon" style={{background: 'rgba(239,68,68,0.1)', borderColor: 'rgba(239,68,68,0.3)'}}>
+              <Users className="w-10 h-10" style={{color: '#ef4444'}} />
+            </div>
+            <h2>This meeting is full</h2>
+            <p>Maximum of {maxPeers} participants reached</p>
+            <button onClick={() => navigate('/dashboard')} className="meet-join-btn">Back to Home</button>
+          </div>
+        ) : !connected ? (
+          <div className="meet-empty-state">
+            <div className="meet-spinner" />
+            <h2>Joining the meeting...</h2>
+            <p>Establishing a secure connection</p>
+          </div>
+        ) : !hasJoinedRoom ? (
+          <div className="meet-prejoin">
+            <div className="meet-prejoin-preview">
+              <div className="meet-preview-card">
+                <div className="meet-preview-avatar">
+                  <span>{(user?.name || 'U').split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2)}</span>
+                </div>
+                <div className="meet-preview-label">{user?.name || 'You'}</div>
               </div>
             </div>
-          ) : !hasJoinedRoom ? (
-            // Join-without-camera mode
-            <div className="flex-1 flex flex-col items-center justify-center gap-6">
-              <div className="text-center">
-                <div className="text-3xl font-bold mb-2">Ready to join?</div>
-                <div className="text-slate-400 mb-6">
-                  You can view and chat without enabling camera/microphone
+            <div className="meet-prejoin-info">
+              <h1 className="meet-prejoin-title">Ready to join?</h1>
+              <p className="meet-prejoin-sub">{peers.length > 0 ? `${peers.length} other${peers.length !== 1 ? 's' : ''} in this meeting` : 'No one else is here yet'}</p>
+              <div className="meet-prejoin-share">
+                <div className="meet-share-label">Meeting link</div>
+                <div className="meet-share-row">
+                  <code className="meet-share-url">{window.location.href}</code>
+                  <button className={`meet-share-copy ${linkCopied ? 'copied' : ''}`} onClick={() => { navigator.clipboard.writeText(window.location.href); setLinkCopied(true); showToast('Link copied!', 'success'); setTimeout(() => setLinkCopied(false), 2000); }}>
+                    {linkCopied ? 'âœ“ Copied' : 'Copy'}
+                  </button>
                 </div>
               </div>
-
-              <div className="grid grid-cols-1 gap-4">
-                <button
-                  onClick={() => setIsScreenSharing(!isScreenSharing)}
-                  className="px-6 py-4 bg-purple-500 hover:bg-purple-600 rounded-xl font-semibold transition"
-                >
-                  📺 Share Screen
-                </button>
-              </div>
-
-              <button
-                onClick={() => {}}
-                className="px-8 py-3 bg-slate-800 hover:bg-slate-700 rounded-xl font-semibold"
-              >
-                Just View (no media)
-              </button>
-
               {peers.length > 0 && (
-                <div className="mt-6 text-center">
-                  <div className="text-sm text-slate-400">
-                    {peers.length} participant{peers.length !== 1 ? 's' : ''} already in this meeting
-                  </div>
+                <div className="meet-prejoin-peers">
+                  {peers.slice(0, 4).map(p => (<div key={p.id} className="meet-peer-chip">{(p.displayName || 'G')[0].toUpperCase()}</div>))}
+                  {peers.length > 4 && <span className="meet-peer-more">+{peers.length - 4}</span>}
                 </div>
               )}
             </div>
-          ) : (
-            // Google Meet Dynamic Grid
-            <div className={`grid gap-4 w-full h-full p-6 place-items-center ${getGridClass(remoteTiles.length)}`}>
-              {remoteTiles.length === 0 ? (
-                <div className="flex flex-col items-center justify-center gap-4 text-slate-500">
-                  <div className="w-20 h-20 rounded-full bg-slate-800/50 flex items-center justify-center border border-slate-700/50">
-                    <UserRound className="w-10 h-10 text-slate-600" />
-                  </div>
-                  <h2 className="text-xl font-medium text-slate-300">You're the only one here</h2>
-                  <p className="text-sm">Waiting for others to join...</p>
+          </div>
+        ) : (
+          <div className="meet-grid" style={{ gridTemplateColumns: totalTiles === 0 ? '1fr' : `repeat(${cols}, 1fr)`, gridTemplateRows: totalTiles === 0 ? '1fr' : `repeat(${rows}, 1fr)` }}>
+            {totalTiles === 0 ? (
+              <div className="meet-empty-state">
+                <div className="meet-empty-icon"><UserRound className="w-10 h-10" /></div>
+                <h2>You're the only one here</h2>
+                <p>Share the meeting link to invite others</p>
+              </div>
+            ) : (
+              remoteTiles.map((t) => (
+                <div key={t.id} className="meet-tile-wrapper">
+                  <VideoTile label={t.label} stream={t.stream} muted={t.muted} isActiveSpeaker={t.id === activeSpeakerId} hasRemoteVideo={t.mediaState?.video} isRemoteAudioMuted={t.mediaState?.audio === false} isHost={t.isHost} />
                 </div>
-              ) : (
-                remoteTiles.map((t) => (
-                  <div key={t.id} className="w-full h-full min-h-[250px] max-h-[80vh] aspect-video">
-                    <VideoTile
-                      label={t.label}
-                      stream={t.stream}
-                      muted={t.muted}
-                      isActiveSpeaker={t.id === activeSpeakerId}
-                      hasRemoteVideo={t.mediaState?.video}
-                      isRemoteAudioMuted={t.mediaState?.audio === false}
-                    />
-                  </div>
-                ))
-              )}
-            </div>
-          )}
-        </div>
-
+              ))
+            )}
+          </div>
+        )}
       </div>
 
-      {/* Slide-in Chat Panel */}
-      <div className={`fixed right-0 top-0 bottom-0 w-80 bg-slate-900 border-l border-slate-800/50 flex flex-col z-40 transform transition-transform duration-300 ease-out shadow-2xl ${chatOpen ? 'translate-x-0' : 'translate-x-full'}`}>
-        <div className="px-5 py-4 border-b border-slate-800/50 flex justify-between items-center bg-slate-900/50 backdrop-blur">
-          <span className="font-semibold flex items-center gap-2"><MessageSquare className="w-4 h-4"/> Meeting Chat</span>
-          <button onClick={() => setChatOpen(false)} className="text-slate-400 hover:text-white text-xl">&times;</button>
+      {/* â”€â”€ Chat Panel â”€â”€ */}
+      <div className={`meet-panel ${chatOpen ? 'meet-panel-open' : ''}`}>
+        <div className="meet-panel-header">
+          <span className="meet-panel-title"><MessageSquare className="w-4 h-4"/> Meeting Chat</span>
+          <button onClick={() => setChatOpen(false)} className="meet-panel-close">&times;</button>
         </div>
-        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
-          {chat.length === 0 ? (
-            <div className="text-center text-slate-500 text-sm mt-10">Messages will appear here</div>
-          ) : (
+        <div className="meet-panel-body">
+          {chat.length === 0 ? (<div className="meet-panel-empty">Messages will appear here</div>) : (
             chat.map((m, idx) => {
               const isSelf = m.from === self?.id;
               return (
-                <div key={idx} className={`flex flex-col max-w-[85%] ${isSelf ? 'ml-auto items-end' : 'items-start'}`}>
-                  <span className="text-[10px] text-slate-400 mb-1 px-1">{isSelf ? 'You' : m.from?.slice(0, 6)}</span>
-                  <div className={`px-4 py-2 text-sm rounded-2xl ${
-                    isSelf 
-                      ? 'bg-blue-600 text-white rounded-br-sm' 
-                      : 'bg-slate-800 text-slate-200 rounded-bl-sm border border-slate-700/50'
-                  }`}>
-                    {m.text}
-                  </div>
+                <div key={idx} className={`meet-chat-msg ${isSelf ? 'meet-chat-self' : ''}`}>
+                  <span className="meet-chat-sender">{isSelf ? 'You' : getPeerName(m.from)}</span>
+                  <div className={`meet-chat-bubble ${isSelf ? 'meet-chat-bubble-self' : ''}`}>{m.text}</div>
                 </div>
               );
             })
           )}
         </div>
-        <div className="p-4 bg-slate-900/90 backdrop-blur border-t border-slate-800/50">
-          <div className="flex gap-2 bg-slate-950 p-1.5 rounded-xl border border-slate-800">
-            <input
-              value={chatDraft}
-              onChange={(e) => setChatDraft(e.target.value)}
-              onKeyDown={(e) =>
-                e.key === 'Enter' &&
-                chatDraft.trim() &&
-                (roomSocketRef.current?.send('chat', { text: chatDraft }), setChatDraft(''))
-              }
-              className="flex-1 bg-transparent px-3 outline-none text-sm placeholder:text-slate-500"
-              placeholder="Message everyone..."
-            />
-            <button
-              onClick={() => {
-                if (chatDraft.trim()) {
-                  roomSocketRef.current?.send('chat', { text: chatDraft });
-                  setChatDraft('');
-                }
-              }}
-              className="p-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors"
-            >
-              <MessageSquare className="w-4 h-4" />
-            </button>
+        <div className="meet-panel-footer">
+          <div className="meet-chat-input-row">
+            <input value={chatDraft} onChange={(e) => setChatDraft(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && chatDraft.trim() && (roomSocketRef.current?.send('chat', { text: chatDraft }), setChatDraft(''))} className="meet-chat-input" placeholder="Send a message..." />
+            <button onClick={() => { if (chatDraft.trim()) { roomSocketRef.current?.send('chat', { text: chatDraft }); setChatDraft(''); } }} className="meet-chat-send"><MessageSquare className="w-4 h-4" /></button>
           </div>
         </div>
       </div>
 
-      {/* Floating Control Bar */}
+      {/* â”€â”€ Participants Panel â”€â”€ */}
+      <div className={`meet-panel ${participantsOpen ? 'meet-panel-open' : ''}`}>
+        <div className="meet-panel-header">
+          <span className="meet-panel-title"><Users className="w-4 h-4"/> People ({participantCount})</span>
+          <button onClick={() => setParticipantsOpen(false)} className="meet-panel-close">&times;</button>
+        </div>
+        <div className="meet-panel-body">
+          <div className="meet-participant meet-participant-self">
+            <div className="meet-participant-avatar meet-participant-avatar-you">{(user?.name || 'Y').split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2)}</div>
+            <div className="meet-participant-info">
+              <div className="meet-participant-name">{user?.name || 'You'} <span className="meet-participant-you">(You)</span></div>
+            </div>
+            {self?.isHost && <span className="meet-host-badge"><Crown className="w-3 h-3"/> Host</span>}
+          </div>
+          {peers.map((p) => {
+            const initials = (p.displayName || 'G').split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2);
+            const pm = peerMediaState[p.id] || {};
+            return (
+              <div key={p.id} className="meet-participant">
+                <div className="meet-participant-avatar">{initials}</div>
+                <div className="meet-participant-info">
+                  <div className="meet-participant-name">{p.displayName || p.id.slice(0, 8)}</div>
+                  <div className="meet-participant-media">
+                    {pm.audio !== false ? <span className="meet-media-on"><Mic className="w-3 h-3"/> On</span> : <span className="meet-media-off"><MicOff className="w-3 h-3"/> Off</span>}
+                    {pm.video ? <span className="meet-media-on"><Video className="w-3 h-3"/> On</span> : <span className="meet-media-off"><VideoOff className="w-3 h-3"/> Off</span>}
+                  </div>
+                </div>
+                {p.isHost ? <span className="meet-host-badge"><Crown className="w-3 h-3"/> Host</span> : <span className="meet-member-badge">Member</span>}
+              </div>
+            );
+          })}
+          {peers.length === 0 && <div className="meet-panel-empty">No other participants yet</div>}
+        </div>
+      </div>
+
+      {/* â”€â”€ Bottom Controls â”€â”€ */}
       {hasJoinedRoom && (
-        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-slate-900/80 backdrop-blur-2xl border border-slate-700/50 rounded-full px-6 py-4 shadow-2xl z-50 transition-all duration-300">
-          <button
-            onClick={toggleMic}
-            className={`group relative p-4 rounded-full transition-all duration-200 ${
-              micEnabled && localStream?.getAudioTracks()[0]?.enabled
-                ? 'bg-slate-800 hover:bg-slate-700'
-                : 'bg-red-500 hover:bg-red-600'
-            }`}
-          >
-            {micEnabled && localStream?.getAudioTracks()[0]?.enabled ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5 text-white" />}
-            <span className="absolute -top-10 left-1/2 -translate-x-1/2 bg-slate-800 mb-2 text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none">
-              Toggle Mic
-            </span>
-          </button>
-          
-          <button
-            onClick={toggleCamera}
-            className={`group relative p-4 rounded-full transition-all duration-200 ${
-              cameraEnabled && localStream?.getVideoTracks()[0]?.enabled
-                ? 'bg-slate-800 hover:bg-slate-700'
-                : 'bg-red-500 hover:bg-red-600'
-            }`}
-          >
-            {cameraEnabled && localStream?.getVideoTracks()[0]?.enabled ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5 text-white" />}
-            <span className="absolute -top-10 left-1/2 -translate-x-1/2 bg-slate-800 mb-2 text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none">
-              Toggle Camera
-            </span>
-          </button>
-
-          <button
-            onClick={isScreenSharing ? stopScreenShare : startScreenShare}
-            className={`group relative p-4 rounded-full transition-all duration-200 ${
-              isScreenSharing
-                ? 'bg-emerald-500 text-white'
-                : 'bg-slate-800 hover:bg-slate-700'
-            }`}
-          >
-            <MonitorUp className="w-5 h-5" />
-            <span className="absolute -top-10 left-1/2 -translate-x-1/2 bg-slate-800 mb-2 text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none">
-              {isScreenSharing ? 'Stop Sharing' : 'Share Screen'}
-            </span>
-          </button>
-
-          <div className="w-px h-8 bg-slate-700/50 mx-2" />
-
-          <button
-            onClick={() => setChatOpen(!chatOpen)}
-            className={`group relative p-4 rounded-full transition-all duration-200 ${
-              chatOpen ? 'bg-blue-600 text-white' : 'bg-slate-800 hover:bg-slate-700'
-            }`}
-          >
-            <MessageSquare className="w-5 h-5" />
-            <span className="absolute -top-10 left-1/2 -translate-x-1/2 bg-slate-800 mb-2 text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none">
-              Chat
-            </span>
-          </button>
-
-          <button
-            onClick={leave}
-            className="group relative p-4 rounded-full bg-red-600 hover:bg-red-700 transition-all duration-200 shadow-lg shadow-red-500/20"
-          >
-            <PhoneMissed className="w-5 h-5 text-white" />
-            <span className="absolute -top-10 left-1/2 -translate-x-1/2 bg-slate-800 mb-2 text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none">
-              Leave Call
-            </span>
-          </button>
+        <div className="meet-controls">
+          <div className="meet-controls-left">
+            <span className="meet-controls-time">{timeString}</span>
+            <span className="meet-controls-room">{roomId}</span>
+          </div>
+          <div className="meet-controls-center">
+            <button onClick={toggleMic} className={`meet-ctrl-btn ${micEnabled && localStream?.getAudioTracks()[0]?.enabled ? '' : 'meet-ctrl-off'}`} title="Toggle microphone">
+              {micEnabled && localStream?.getAudioTracks()[0]?.enabled ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
+            </button>
+            <button onClick={toggleCamera} className={`meet-ctrl-btn ${cameraEnabled && localStream?.getVideoTracks()[0]?.enabled ? '' : 'meet-ctrl-off'}`} title="Toggle camera">
+              {cameraEnabled && localStream?.getVideoTracks()[0]?.enabled ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
+            </button>
+            <button onClick={isScreenSharing ? stopScreenShare : startScreenShare} className={`meet-ctrl-btn ${isScreenSharing ? 'meet-ctrl-active' : ''}`} title={isScreenSharing ? 'Stop presenting' : 'Present now'}>
+              <MonitorUp className="w-5 h-5" />
+            </button>
+            <button onClick={leave} className="meet-ctrl-btn meet-ctrl-leave" title="Leave call">
+              <PhoneMissed className="w-5 h-5" />
+            </button>
+          </div>
+          <div className="meet-controls-right">
+            <button onClick={() => { setChatOpen(!chatOpen); if (participantsOpen) setParticipantsOpen(false); }} className={`meet-ctrl-btn-sm ${chatOpen ? 'meet-ctrl-sm-active' : ''}`} title="Chat">
+              <MessageSquare className="w-5 h-5" />
+            </button>
+            <button onClick={() => { setParticipantsOpen(!participantsOpen); if (chatOpen) setChatOpen(false); }} className={`meet-ctrl-btn-sm ${participantsOpen ? 'meet-ctrl-sm-active' : ''}`} title="People">
+              <Users className="w-5 h-5" />
+            </button>
+          </div>
         </div>
       )}
 
-      {/* Picture-in-Picture Local Viewer */}
+      {/* â”€â”€ Self-View PiP â”€â”€ */}
       {hasJoinedRoom && cameraEnabled && localStream && (
-        <div className="fixed bottom-28 right-6 w-64 aspect-video rounded-2xl shadow-2xl border border-slate-700/50 bg-slate-900 z-40 overflow-hidden transform hover:scale-105 transition-transform cursor-pointer">
-          <VideoTile
-            label="You"
-            stream={localStream}
-            muted={true}
-            showModerated={aiOn}
-            moderationSocket={moderationWsRef.current}
-            isActiveSpeaker={false}
+        <div className="meet-pip">
+          <VideoTile 
+            label={user?.name || 'You'} 
+            stream={localStream} 
+            muted={true} 
+            showModerated={aiOn} 
+            moderationSocket={moderationWsRef.current} 
+            isActiveSpeaker={false} 
+            isHost={self?.isHost} 
+            yoloDetectionsRef={yoloDetectionsRef}
           />
         </div>
       )}
 
-      {/* Toast Notifications */}
-      {toastMessage && (
-        <div
-          className={`fixed bottom-6 right-6 px-4 py-3 rounded-xl font-semibold backdrop-blur-xl border ${
-            toastType === 'error'
-              ? 'bg-red-500/20 border-red-500/50 text-red-200'
-              : toastType === 'success'
-                ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-200'
-                : 'bg-blue-500/20 border-blue-500/50 text-blue-200'
-          }`}
-        >
-          {toastMessage}
-        </div>
-      )}
+      {/* â”€â”€ Toast â”€â”€ */}
+      {toastMessage && <div className={`meet-toast meet-toast-${toastType}`}>{toastMessage}</div>}
 
-      {/* Audio Sanitized Banner */}
-      {audioSanitized && (
-        <div className="px-5 py-2 bg-red-500/10 border-b border-red-500/30 text-red-200 text-sm font-semibold">
-          ⚠️ Audio sanitized (temporary mic mute due to content moderation)
-        </div>
-      )}
+      {/* â”€â”€ Audio Warning â”€â”€ */}
+      {audioSanitized && <div className="meet-audio-warn">âš ï¸ Audio muted â€” content moderation active</div>}
     </div>
   );
 }

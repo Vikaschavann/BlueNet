@@ -45,6 +45,8 @@ class MeetingSignalingServer:
         if coros:
             await asyncio.gather(*coros, return_exceptions=True)
 
+    MAX_PEERS = 12  # Maximum participants per room
+
     async def handle(self, websocket: WebSocket, room_id: str):
         await websocket.accept()
 
@@ -53,6 +55,16 @@ class MeetingSignalingServer:
 
         async with self._lock:
             room = self._rooms.setdefault(room_id, {})
+
+            # Enforce participant limit
+            if len(room) >= self.MAX_PEERS:
+                await self._send(websocket, {
+                    "type": "room_full",
+                    "data": {"roomId": room_id, "maxPeers": self.MAX_PEERS},
+                })
+                await websocket.close(code=1008, reason="Room is full")
+                return
+
             is_first = len(room) == 0
             client = Client(id=client_id, ws=websocket, is_host=is_first)
             room[client_id] = client
@@ -62,6 +74,7 @@ class MeetingSignalingServer:
                 for c in room.values()
                 if c.id != client_id
             ]
+            peer_count = len(room)
 
         logging.info(f"[ROOM] join room={room_id} client={client_id} host={client.is_host}")
 
@@ -74,6 +87,8 @@ class MeetingSignalingServer:
                     "roomId": room_id,
                     "self": {"id": client_id, "isHost": client.is_host, "displayName": client.display_name},
                     "peers": peers,
+                    "peerCount": peer_count,
+                    "maxPeers": self.MAX_PEERS,
                 },
             },
         )
@@ -83,7 +98,11 @@ class MeetingSignalingServer:
             room_id,
             {
                 "type": "peer_joined",
-                "data": {"peer": {"id": client_id, "displayName": client.display_name, "isHost": client.is_host}},
+                "data": {
+                    "peer": {"id": client_id, "displayName": client.display_name, "isHost": client.is_host},
+                    "peerCount": peer_count,
+                    "maxPeers": self.MAX_PEERS,
+                },
             },
             exclude=client_id,
         )
