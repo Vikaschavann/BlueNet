@@ -1,3 +1,5 @@
+import { HandLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
 export class VideoProcessor {
     constructor(options = {}) {
         // Accuracy Boost: Restored to 640x480. 
@@ -43,6 +45,28 @@ export class VideoProcessor {
         this.video = null;
         this.canvas = null;
         this.animationId = null;
+
+        // Load Hand Landmarker dynamically for gesture moderation
+        this.initHandLandmarker();
+    }
+
+    async initHandLandmarker() {
+        try {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+            );
+            this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 2
+            });
+            console.log("[VideoProcessor] Hand Landmarker loaded successfully.");
+        } catch (err) {
+            console.warn("[VideoProcessor] Hand Landmarker failed to load.", err);
+        }
     }
 
     notifyFrameSent() {
@@ -65,6 +89,22 @@ export class VideoProcessor {
         this.blurRegions = [];
         this.persistenceBuffer = [];
         this.smoothedRegions = [];
+    }
+
+    setAiState(enabled) {
+        this.aiEnabled = enabled;
+        if (!enabled) {
+            this.clearState();
+        }
+    }
+
+    clearState() {
+        this.isGloballyBlurred = false;
+        this.blurRegions = [];
+        this.persistenceBuffer = [];
+        this.smoothedRegions = [];
+        this.lockdownUntil = 0;
+        this.shieldLife = 0;
     }
 
     // This is called by VideoCall when WebSocket receives message
@@ -191,11 +231,26 @@ export class VideoProcessor {
             return;
         }
 
+        // Dynamically sync canvas resolution to video stream natively!
+        if (this.video.videoWidth > 0 && (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight)) {
+            this.canvas.width = this.video.videoWidth;
+            this.canvas.height = this.video.videoHeight;
+            this.blurBuffer.width = this.canvas.width;
+            this.blurBuffer.height = this.canvas.height;
+        }
+
         const ctx = this.canvas.getContext("2d", { alpha: false });
         const { width, height } = this.canvas;
         
         // 0. Ensure canvas resets every frame cleanly
         ctx.clearRect(0, 0, width, height);
+
+        // Bypass AI processing completely if disabled
+        if (this.aiEnabled === false) {
+            ctx.filter = "none";
+            ctx.drawImage(this.video, 0, 0, width, height);
+            return;
+        }
 
         // 1. Calculate Lockdown State (Full Frame Blur)
         const isInLockdown = Date.now() < this.lockdownUntil || this.isGloballyBlurred;
@@ -209,6 +264,82 @@ export class VideoProcessor {
 
         // 2. Draw Video Frame (Subject to Lockdown filter)
         ctx.drawImage(this.video, 0, 0, width, height);
+
+        // 2b. Front-end specific gesture moderation (Middle Finger)
+        let localRegions = [];
+        if (this.handLandmarker && this.video.currentTime > 0) {
+            try {
+                const results = this.handLandmarker.detectForVideo(this.video, performance.now());
+                if (results && results.landmarks) {
+                    for (const landmarks of results.landmarks) {
+                        // MediaPipe Landmarks:
+                        // 0: Wrist
+                        // 5: Index MCP, 6: PIP, 8: TIP
+                        // 9: Middle MCP, 10: PIP, 12: TIP
+                        // 13: Ring MCP, 14: PIP, 16: TIP
+                        // 17: Pinky MCP, 18: PIP, 20: TIP
+                        const middleTip = landmarks[12];
+                        const middleMcp = landmarks[9];
+                        
+                        const indexTip = landmarks[8];
+                        const indexPip = landmarks[6];
+                        
+                        const ringTip = landmarks[16];
+                        const ringPip = landmarks[14];
+                        
+                        const pinkyTip = landmarks[20];
+                        const pinkyPip = landmarks[18];
+
+                        // Heuristic: Y goes down. If TIP y is less than MCP/PIP y, finger is pointing up.
+                        // Middle finger must be fully extended
+                        const isMiddleExtended = middleTip.y < middleMcp.y - 0.02;
+                        // Others must be folded (TIP is lower than PIP)
+                        const isIndexFolded = indexTip.y > indexPip.y;
+                        const isRingFolded = ringTip.y > ringPip.y;
+                        const isPinkyFolded = pinkyTip.y > pinkyPip.y;
+
+                        if (isMiddleExtended && isIndexFolded && isRingFolded && isPinkyFolded) {
+                            // Middle finger detected! Get bounding box of the hand
+                            let xMin = 1, yMin = 1, xMax = 0, yMax = 0;
+                            for (const lm of landmarks) {
+                                if (lm.x < xMin) xMin = lm.x;
+                                if (lm.y < yMin) yMin = lm.y;
+                                if (lm.x > xMax) xMax = lm.x;
+                                if (lm.y > yMax) yMax = lm.y;
+                            }
+                            
+                            const w = (xMax - xMin) * width;
+                            const h_box = (yMax - yMin) * height;
+                            
+                            // 30% padding
+                            const padX = w * 0.3;
+                            const padY = h_box * 0.3;
+                            
+                            localRegions.push({
+                                id: `middle_finger_${Math.random()}`,
+                                x: (xMin * width) - padX,
+                                y: (yMin * height) - padY,
+                                width: w + padX * 2,
+                                height: h_box + padY * 2,
+                                life: 5
+                            });
+                        }
+                    }
+                }
+            } catch (err) {
+                // Ignore detection errors for single frames
+            }
+        }
+
+        // Add local gesture regions into smoothedRegions to be rendered immediately
+        localRegions.forEach(lr => {
+            this.smoothedRegions.push(lr);
+            if (!this.hasLocalUnsafeAlertTriggered) {
+                this.hasLocalUnsafeAlertTriggered = true;
+                // Temporarily mark as unsafe to trigger UI banners
+                this.isGloballyBlurred = false; 
+            }
+        });
 
         // 3. Selective Regional Blur (Secondary Layer of Safety)
         // We do this even during lockdown for redundant masking of the source
@@ -234,33 +365,52 @@ export class VideoProcessor {
                 let sr = this.smoothedRegions.find(s => s.id === region.id);
                 if (!sr) {
                     sr = { ...region, life: region.life };
+                    // If from backend, coordinates are relative to modelWidth/modelHeight
+                    // Convert them to video width/height first
+                    const backendToVideoX = this.video.videoWidth / this.modelWidth;
+                    const backendToVideoY = this.video.videoHeight / this.modelHeight;
+                    const scaleX = width / this.video.videoWidth;
+                    const scaleY = height / this.video.videoHeight;
+                    
+                    sr.x = sr.x * backendToVideoX * scaleX;
+                    sr.y = sr.y * backendToVideoY * scaleY;
+                    sr.width = sr.width * backendToVideoX * scaleX;
+                    sr.height = sr.height * backendToVideoY * scaleY;
+                    
                     this.smoothedRegions.push(sr);
                 } else {
-                    sr.x = sr.x + this.smoothingFactor * (region.x - sr.x);
-                    sr.y = sr.y + this.smoothingFactor * (region.y - sr.y);
-                    sr.width = sr.width + this.smoothingFactor * (region.width - sr.width);
-                    sr.height = sr.height + this.smoothingFactor * (region.height - sr.height);
+                    // Update existing region...
+                    const backendToVideoX = this.video.videoWidth / this.modelWidth;
+                    const backendToVideoY = this.video.videoHeight / this.modelHeight;
+                    const scaleX = width / this.video.videoWidth;
+                    const scaleY = height / this.video.videoHeight;
+                    
+                    const newX = region.x * backendToVideoX * scaleX;
+                    const newY = region.y * backendToVideoY * scaleY;
+                    const newW = region.width * backendToVideoX * scaleX;
+                    const newH = region.height * backendToVideoY * scaleY;
+
+                    sr.x = sr.x + this.smoothingFactor * (newX - sr.x);
+                    sr.y = sr.y + this.smoothingFactor * (newY - sr.y);
+                    sr.width = sr.width + this.smoothingFactor * (newW - sr.width);
+                    sr.height = sr.height + this.smoothingFactor * (newH - sr.height);
                     sr.life = region.life;
                 }
             });
 
             this.smoothedRegions.forEach((region) => {
-                const sx_raw = region.x * backendToVideoX;
-                const sy_raw = region.y * backendToVideoY;
-                const sw_raw = region.width * backendToVideoX;
-                const sh_raw = region.height * backendToVideoY;
+                let x = region.x;
+                let y = region.y;
+                let w = region.width;
+                let h = region.height;
 
-                let x = sx_raw * scaleX;
-                let y = sy_raw * scaleY;
-                let w = sw_raw * scaleX;
-                let h = sh_raw * scaleY;
-
-                // Expand each region significantly (padding 50-80px overlay) to ensure 
-                // absolutely no unblurred slivers escape between fast rendering updates
-                x -= 40;
-                y -= 40;
-                w += 80;
-                h += 80;
+                // Proportional padding (25% of region size) for complete coverage
+                const padX = w * 0.25;
+                const padY = h * 0.25;
+                x -= padX;
+                y -= padY;
+                w += padX * 2;
+                h += padY * 2;
 
                 // Normalize coordinates to stay safely inside canvas dimensions
                 x = Math.max(0, x);
@@ -271,11 +421,6 @@ export class VideoProcessor {
                 // Overlay the surgical blur patch seamlessly
                 ctx.filter = "none"; // Reset filter for the patch draw
                 ctx.drawImage(this.blurBuffer, x, y, w, h, x, y, w, h);
-
-                // Professional debug indicator
-                ctx.strokeStyle = "rgba(255, 0, 0, 0.4)";
-                ctx.lineWidth = 2;
-                ctx.strokeRect(x, y, w, h);
 
                 region.life -= 1;
             });

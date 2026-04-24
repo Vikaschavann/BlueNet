@@ -34,6 +34,7 @@ import { WebSocketClient } from '../utils/WebSocketClient';
 import { AudioProcessor } from '../utils/AudioProcessor';
 import { useMediaPermissions } from '../hooks/useMediaPermissions';
 import { VideoProcessor } from '../utils/VideoProcessor';
+import { useAuth } from '../context/AuthContext';
 
 function shortId() {
   const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -45,6 +46,7 @@ function shortId() {
 export default function Room() {
   const { roomId } = useParams();
   const navigate = useNavigate();
+  const { user } = useAuth();
 
   const SIGNAL_BASE = useMemo(
     () => import.meta.env.VITE_SIGNALING_WS_BASE || 'ws://localhost:8000/ws/room',
@@ -156,7 +158,10 @@ export default function Room() {
   const micEnabledRef = useRef(micEnabled);
   const isCameraBlockedRef = useRef(isCameraBlocked);
 
-  useEffect(() => { aiOnRef.current = aiOn; }, [aiOn]);
+  useEffect(() => { 
+    aiOnRef.current = aiOn; 
+    videoProcRef.current?.setAiState?.(aiOn);
+  }, [aiOn]);
   useEffect(() => { localStreamRef.current = localStream; }, [localStream]);
   useEffect(() => { micEnabledRef.current = micEnabled; }, [micEnabled]);
   useEffect(() => { isCameraBlockedRef.current = isCameraBlocked; }, [isCameraBlocked]);
@@ -179,6 +184,7 @@ export default function Room() {
     const roomSocket = new RoomSocket({
       baseUrl: SIGNAL_BASE,
       roomId,
+      name: user?.name,
       onMessage: handleRoomMessage,
     });
     roomSocketRef.current = roomSocket;
@@ -734,8 +740,8 @@ export default function Room() {
             if (!proc) return;
             const now = Date.now();
             if (proc.isBackendProcessing) {
-              if (now - proc.lastFrameSentAt > 500) {
-                 console.log("Failsafe: Backend lagging >500ms");
+              if (now - proc.lastFrameSentAt > 1500) {
+                 console.log("Failsafe: Backend lagging >1500ms");
                  proc.triggerFailsafeBlur();
               }
             } else if (aiOnRef.current && moderationWsRef.current?.isConnected) {
@@ -793,6 +799,14 @@ export default function Room() {
         rawVideoTrackRef.current.stop();
         rawVideoTrackRef.current = null;
       }
+
+      // Fix UI getting stuck in 'Unsafe' state after turning camera off
+      if (videoProcRef.current) {
+         videoProcRef.current.isBackendProcessing = false;
+         videoProcRef.current.clearState?.(); // Make sure to call clearState if available
+      }
+      setShowUnsafeAlert(false);
+      unsafeAlertRef.current = false;
 
       const videoTracks = localStream?.getVideoTracks() || [];
       videoTracks.forEach((t) => {
@@ -861,8 +875,8 @@ export default function Room() {
           if (!proc) return;
           const now = Date.now();
           if (proc.isBackendProcessing) {
-            if (now - proc.lastFrameSentAt > 500) {
-               console.log("Failsafe: Backend lagging >500ms");
+            if (now - proc.lastFrameSentAt > 1500) {
+               console.log("Failsafe: Backend lagging >1500ms");
                proc.triggerFailsafeBlur();
             }
           } else if (aiOnRef.current && moderationWsRef.current?.isConnected) {
@@ -962,8 +976,8 @@ export default function Room() {
         if (!proc) return;
         const now = Date.now();
         if (proc.isBackendProcessing) {
-          if (now - proc.lastFrameSentAt > 500) {
-             console.log("Failsafe: Backend lagging >500ms");
+          if (now - proc.lastFrameSentAt > 1500) {
+             console.log("Failsafe: Backend lagging >1500ms");
              proc.triggerFailsafeBlur();
           }
         } else if (aiOnRef.current && moderationWsRef.current?.isConnected) {
@@ -1200,7 +1214,9 @@ export default function Room() {
               const isSelf = m.from === self?.id;
               return (
                 <div key={idx} className={`flex flex-col max-w-[85%] ${isSelf ? 'ml-auto items-end' : 'items-start'}`}>
-                  <span className="text-[10px] text-slate-400 mb-1 px-1">{isSelf ? 'You' : m.from?.slice(0, 6)}</span>
+                  <span className="text-[10px] text-slate-400 mb-1 px-1">
+                    {isSelf ? 'You' : (peers.find(p => p.id === m.from)?.displayName || m.from?.slice(0, 6))}
+                  </span>
                   <div className={`px-4 py-2 text-sm rounded-2xl ${
                     isSelf 
                       ? 'bg-blue-600 text-white rounded-br-sm' 

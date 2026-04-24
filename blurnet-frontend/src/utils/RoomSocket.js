@@ -1,8 +1,8 @@
 import { WebSocketClient } from './WebSocketClient';
 
 export class RoomSocket {
-  constructor({ baseUrl, roomId, onMessage }) {
-    const url = `${baseUrl.replace(/\/$/, '')}/${encodeURIComponent(roomId)}`;
+  constructor({ baseUrl, roomId, name, onMessage }) {
+    const url = `${baseUrl.replace(/\/$/, '')}/${encodeURIComponent(roomId)}?name=${encodeURIComponent(name || 'Guest')}`;
     this.client = new WebSocketClient(url, onMessage);
   }
 

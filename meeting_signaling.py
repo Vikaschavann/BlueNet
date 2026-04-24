@@ -49,12 +49,13 @@ class MeetingSignalingServer:
         await websocket.accept()
 
         client_id = uuid.uuid4().hex
+        display_name = websocket.query_params.get("name", "Guest")
         client: Optional[Client] = None
 
         async with self._lock:
             room = self._rooms.setdefault(room_id, {})
             is_first = len(room) == 0
-            client = Client(id=client_id, ws=websocket, is_host=is_first)
+            client = Client(id=client_id, ws=websocket, display_name=display_name, is_host=is_first)
             room[client_id] = client
 
             peers = [

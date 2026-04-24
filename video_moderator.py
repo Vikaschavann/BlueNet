@@ -73,8 +73,8 @@ class VideoModerator:
                 score = float(d['score'])
                 max_score = max(max_score, score)
                 
-                # Dynamic Thresholding: Even more aggressive for the Sentinel Engine
-                base_threshold = 0.10 if "EXPOSED" in label else 0.22
+                # Dynamic Thresholding: Much stricter to prevent false positives (like blurring faces)
+                base_threshold = 0.45 if "EXPOSED" in label else 0.55
                 
                 if label in target_labels and score > base_threshold:
                     is_unsafe = True
@@ -86,8 +86,8 @@ class VideoModerator:
                     elif val3 > x and val4 > y: w, h = val3 - x, val4 - y
                     else: w, h = val3, val4
 
-                    # Expansion with Contextual Intelligence
-                    expansion = 0.55 if "COVERED" in label else 0.45
+                    # Expansion padding (reduced to avoid bleeding onto faces, frontend adds 15% anyway)
+                    expansion = 0.20 if "COVERED" in label else 0.15
                     pw, ph = w * expansion, h * expansion
                     
                     regions.append({
